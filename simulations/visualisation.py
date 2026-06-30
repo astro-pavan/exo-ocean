@@ -1,4 +1,4 @@
-import reader
+import simulations.simulation_reader as simulation_reader
 
 import numpy as np
 from bokeh.plotting import figure
@@ -7,7 +7,7 @@ from bokeh.layouts import gridplot, column, row
 from bokeh.io import curdoc
 from bokeh.palettes import Magma256, RdBu11, PiYG11
 
-lon, lat, z, u, v, w, T = reader.import_data('oceananigans/runs/aquaplanet_15_1000_2.nc')
+lon, lat, z, u, v, w, T = simulation_reader.import_data('simulations/runs/test.nc')
 
 skip_xy = 3
 skip_z = 1 # Z only has 20 points, so we might not need to skip

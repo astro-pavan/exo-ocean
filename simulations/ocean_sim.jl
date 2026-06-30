@@ -1,21 +1,24 @@
 using Oceananigans
 using Oceananigans.Units
 using NCDatasets
-using Oceananigans.Grids: Center
 using Oceananigans.Diagnostics: AdvectiveCFL
 using Statistics
 using CUDA
 
 const omega_Earth = 7.29e-5 # 1 rotation per day in rad/s
 const R_Earth = 6371000 # m
+const solar_constant = 1361 # W/m^2
 
 const rho_seawater = 1026 # kg/m^3
 const rho_air = 1.2 # kg/m^3
 const C_D_wind = 0.002
 
-const C_Bottom_Drag = 2e-3 
+const C_Bottom_Drag = 2e-3
+const cp_seawater = 3994.0  # J/(kg·K)
 
-@inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, heat_flux, simulation_time, n_lat=80,n_lon=360, n_depth=20, use_GPU=true, n_write=1000)
+@inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, instellation, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_stress=nothing, initial_T=1.0, albedo=0.06)
+
+    arch = use_GPU ? GPU() : CPU()
 
     # Grid
     grid = LatitudeLongitudeGrid(arch, Float32,
@@ -23,11 +26,14 @@ const C_Bottom_Drag = 2e-3
                                 longitude = (-180, 180),
                                 latitude = (-80, 80),
                                 z = (-ocean_depth, 0),
+                                radius = planet_radius,
                                 topology = (Periodic, Bounded, Bounded))
 
     # Coriolis Force
     if rotational_period != 0
-        coriolis = HydrostaticSphericalCoriolis(rotation_rate = omega_Earth / t_rotation)
+        coriolis = HydrostaticSphericalCoriolis(rotation_rate = omega_Earth / rotational_period)
+    else
+        coriolis = HydrostaticSphericalCoriolis(rotation_rate = 0)
     end
 
     # Linear Equation of State
@@ -53,13 +59,34 @@ const C_Bottom_Drag = 2e-3
     v_bottom_bc = FluxBoundaryCondition(bottom_drag_v, discrete_form=true)
 
     # Boundary Conditions
-    if wind
+    if !isnothing(wind_stress)
+        error("Wind stress boundary conditions are not yet implemented.")
         # u_bcs = FieldBoundaryConditions(top = u_top_bc, bottom = u_bottom_bc)
         # v_bcs = FieldBoundaryConditions(top = v_top_bc, bottom = v_bottom_bc)
-    else
-        u_bcs = FieldBoundaryConditions(bottom = u_bottom_bc)
-        v_bcs = FieldBoundaryConditions(bottom = v_bottom_bc)
     end
+    u_bcs = FieldBoundaryConditions(bottom = u_bottom_bc)
+    v_bcs = FieldBoundaryConditions(bottom = v_bottom_bc)
+
+    # Heat Flux
+    # Uniform cooling tuned so total absorbed stellar power = total cooling power.
+    # Stellar integral: ∫_{-π/2}^{π/2} cos(lon) dlon × ∫_{-80°}^{80°} cos²(lat) dlat
+    # Area integral:    ∫_{-π}^{π} dlon × ∫_{-80°}^{80°} cos(lat) dlat
+    lat_min_rad = -80π / 180
+    lat_max_rad =  80π / 180
+    stellar_integral = 2.0 * (0.5*(lat_max_rad - lat_min_rad) + 0.25*(sin(2*lat_max_rad) - sin(2*lat_min_rad)))
+    ocean_area_integral = 2π * (sin(lat_max_rad) - sin(lat_min_rad))
+    Q_cool = instellation * (1 - albedo) * stellar_integral / ocean_area_integral
+
+    @inline function surface_heat_flux(lon, lat, t, p)
+        lon_rad = lon * π / 180
+        lat_rad = lat * π / 180
+        Q_stellar = p.instellation * (1 - p.albedo) * max(zero(lon_rad), cos(lon_rad) * cos(lat_rad))
+        return -(Q_stellar - p.Q_cool) / (rho_seawater * cp_seawater) # sign convention in Oceanigans means that heating is negative
+    end
+
+    heat_flux_params = (instellation = instellation, albedo = albedo, Q_cool = Q_cool)
+    T_top_bc = FluxBoundaryCondition(surface_heat_flux, parameters = heat_flux_params)
+    T_bcs = FieldBoundaryConditions(top = T_top_bc)
 
     # Diffusivity
     convective_adjustment = ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0)
@@ -74,11 +101,11 @@ const C_Bottom_Drag = 2e-3
                                     tracers = (:T, :S),
                                     closure = closure,
                                     free_surface = ImplicitFreeSurface(),
-                                    boundary_conditions = (; T = T_bcs, u = u_bcs, v = v_bcs))
+                                    boundary_conditions = (; u = u_bcs, v = v_bcs, T = T_bcs))
 
     set!(model, T = initial_T, S = 35.0)
 
-    simulation = Simulation(model, Δt=2minutes, stop_time=t_max)
+    simulation = Simulation(model, Δt=2minutes, stop_time=simulation_time)
 
     cfl = AdvectiveCFL(simulation.Δt)
 
@@ -101,14 +128,14 @@ const C_Bottom_Drag = 2e-3
             "Mean T: $(round(mean_T, digits=2)) °C"
     end
 
-    simulation.callbacks[:progress] = Callback(progress, IterationInterval(100))
+    simulation.callbacks[:progress] = Callback(display_progress, IterationInterval(100))
 
-    output_filename = "simulations/runs/$(simulation_name).nc"
+    output_filename = joinpath(@__DIR__, "runs", "$(simulation_name).nc")
 
     simulation.output_writers[:full_3d] = NetCDFWriter(model, 
                                                     (; T=model.tracers.T, u=model.velocities.u, v=model.velocities.v, w=model.velocities.w), 
                                                     filename=output_filename,
-                                                    schedule=TimeInterval(t_write),
+                                                    schedule=IterationInterval(n_write),
                                                     overwrite_existing=true)
 
 

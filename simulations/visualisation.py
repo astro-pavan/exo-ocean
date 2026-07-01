@@ -1,4 +1,4 @@
-import simulations.simulation_reader as simulation_reader
+import simulation_reader
 
 import numpy as np
 from bokeh.plotting import figure
@@ -7,10 +7,14 @@ from bokeh.layouts import gridplot, column, row
 from bokeh.io import curdoc
 from bokeh.palettes import Magma256, RdBu11, PiYG11
 
-lon, lat, z, u, v, w, T = simulation_reader.import_data('simulations/runs/test.nc')
+sim = simulation_reader.SimulationData('simulations/runs/run_atm_test_0008/output.nc')
+lon, lat, z, u, v, w, T = sim.lon, sim.lat, sim.z, sim.u, sim.v, sim.w, sim.T
 
-skip_xy = 3
-skip_z = 1 # Z only has 20 points, so we might not need to skip
+is_atmosphere = sim.sim_type == 'atmosphere'
+z_label = "Pressure Level (σ)" if is_atmosphere else "Depth (m)"
+
+skip_xy = 1
+skip_z = 1
 
 lon_sub = lon[::skip_xy]
 lat_sub = lat[::skip_xy]
@@ -25,19 +29,29 @@ min_lon, max_lon = np.min(lon), np.max(lon)
 min_lat, max_lat = np.min(lat), np.max(lat)
 min_z, max_z = np.min(z), np.max(z)
 
-# --- NEW: Setup dictionaries for the background variables and their limits ---
+# Build bg_options dynamically — mslp is 2D so tile it to 3D for uniform slicing
 bg_options = {
     "Temperature (T)": T,
     "Zonal Velocity (u)": u,
     "Meridional Velocity (v)": v,
-    "Vertical Velocity (w)": w
 }
+if w is not None:
+    bg_options["Vertical Velocity (w)"] = w
+if sim.mslp is not None:
+    bg_options["Mean SL Pressure"] = np.tile(sim.mslp[np.newaxis, :, :], (len(z), 1, 1))
+if sim.vor is not None:
+    bg_options["Vorticity (vor)"] = sim.vor
 
 # Pre-calculate min/max for all variables.
 # Velocities get symmetric limits (-max to +max) so 0 is exactly in the middle.
+# Temperature gets per-layer limits (list of (min, max) per z index) so small horizontal
+# contrasts at the surface aren't invisible compared to the large vertical temperature gradient.
 bg_limits = {}
 for name, arr in bg_options.items():
     if name == "Temperature (T)":
+        # Store per-layer limits so the colormap adapts when the z slider moves
+        bg_limits[name] = [(np.nanmin(arr[k]), np.nanmax(arr[k])) for k in range(len(z))]
+    elif name == "Mean SL Pressure":
         bg_limits[name] = (np.nanmin(arr), np.nanmax(arr))
     elif name == "Vertical Velocity (w)":
         max_abs = np.nanmax(np.abs(arr))
@@ -46,11 +60,17 @@ for name, arr in bg_options.items():
         max_abs = np.nanmax(np.abs(arr))
         bg_limits[name] = (-max_abs, max_abs)
 
-# Initialize Color Mapper with default Temperature limits
-init_bg_name = "Temperature (T)"
-color_mapper = LinearColorMapper(palette=Magma256, low=bg_limits[init_bg_name][0], high=bg_limits[init_bg_name][1])
+def get_color_limits(bg_name, z_idx):
+    lims = bg_limits[bg_name]
+    if bg_name == "Temperature (T)":
+        return lims[z_idx]
+    return lims
 
-# --- Modified Slice Functions (Now accept bg_array) ---
+init_bg_name = "Temperature (T)"
+init_z_idx = len(z) - 1
+init_limits = get_color_limits(init_bg_name, init_z_idx)
+color_mapper = LinearColorMapper(palette=Magma256, low=init_limits[0], high=init_limits[1])
+
 def get_xy_slice(z_idx, bg_array):
     """Lat-Lon plane (Main Plot)"""
     u_sub = u[z_idx, ::skip_xy, ::skip_xy].flatten()
@@ -59,48 +79,54 @@ def get_xy_slice(z_idx, bg_array):
     y = Lat_xy.flatten()
 
     scale = 5 / (np.sqrt(u_sub ** 2 + v_sub ** 2) + 1e-10)
-    
+
     x1 = np.nan_to_num(x + (u_sub * scale), nan=x, posinf=x, neginf=x)
     y1 = np.nan_to_num(y + (v_sub * scale), nan=y, posinf=y, neginf=y)
-    
-    # Extract image from whatever array was passed in
+
     bg_img = bg_array[z_idx, :, :]
-    
+
     return dict(x0=x, y0=y, x1=x1, y1=y1), dict(img=[bg_img])
 
 def get_xz_slice(lat_idx, bg_array):
     """Lon-Z plane (Bottom Plot)"""
     u_sub = u[::skip_z, lat_idx, ::skip_xy].flatten()
-    w_sub = w[::skip_z, lat_idx, ::skip_xy].flatten()
     x = Lon_xz.flatten()
     y = Z_xz.flatten()
 
-    w_scale_multiplier = 20 * np.mean(np.abs(u_sub)) / np.mean(np.abs(w_sub))
-    scale = 20 / (np.sqrt((u_sub ** 2 + (w_sub * w_scale_multiplier) ** 2)) + 1e-10)
-    
-    x1 = np.nan_to_num(x + (u_sub * scale), nan=x, posinf=x, neginf=x)
-    y1 = np.nan_to_num(y + (w_sub * scale * w_scale_multiplier), nan=y, posinf=y, neginf=y)
-    
+    if w is not None:
+        w_sub = w[::skip_z, lat_idx, ::skip_xy].flatten()
+        w_scale_multiplier = 20 * np.mean(np.abs(u_sub)) / (np.mean(np.abs(w_sub)) + 1e-10)
+        scale = 20 / (np.sqrt((u_sub ** 2 + (w_sub * w_scale_multiplier) ** 2)) + 1e-10)
+        x1 = np.nan_to_num(x + (u_sub * scale), nan=x, posinf=x, neginf=x)
+        y1 = np.nan_to_num(y + (w_sub * scale * w_scale_multiplier), nan=y, posinf=y, neginf=y)
+    else:
+        scale = 5 / (np.abs(u_sub) + 1e-10)
+        x1 = np.nan_to_num(x + (u_sub * scale), nan=x, posinf=x, neginf=x)
+        y1 = y
+
     bg_img = bg_array[:, lat_idx, :]
-    
+
     return dict(x0=x, y0=y, x1=x1, y1=y1), dict(img=[bg_img])
 
 def get_yz_slice(lon_idx, bg_array):
     """Lat-Z plane (Right Plot) - Flipped Axes"""
     v_sub = v[::skip_z, ::skip_xy, lon_idx].flatten()
-    w_sub = w[::skip_z, ::skip_xy, lon_idx].flatten()
-    
     x = Z_yz.flatten()
     y = Lat_yz.flatten()
 
-    w_scale_multiplier = 20 * np.mean(np.abs(v_sub)) / np.mean(np.abs(w_sub))
-    scale = 20 / (np.sqrt((v_sub ** 2 + (w_sub * w_scale_multiplier) ** 2)) + 1e-10)
-    
-    x1 = np.nan_to_num(x + (w_sub * scale * w_scale_multiplier), nan=x, posinf=x, neginf=x)
-    y1 = np.nan_to_num(y + (v_sub * scale), nan=y, posinf=y, neginf=y)
-    
+    if w is not None:
+        w_sub = w[::skip_z, ::skip_xy, lon_idx].flatten()
+        w_scale_multiplier = 20 * np.mean(np.abs(v_sub)) / (np.mean(np.abs(w_sub)) + 1e-10)
+        scale = 20 / (np.sqrt((v_sub ** 2 + (w_sub * w_scale_multiplier) ** 2)) + 1e-10)
+        x1 = np.nan_to_num(x + (w_sub * scale * w_scale_multiplier), nan=x, posinf=x, neginf=x)
+        y1 = np.nan_to_num(y + (v_sub * scale), nan=y, posinf=y, neginf=y)
+    else:
+        scale = 5 / (np.abs(v_sub) + 1e-10)
+        x1 = x
+        y1 = np.nan_to_num(y + (v_sub * scale), nan=y, posinf=y, neginf=y)
+
     bg_img = bg_array[:, :, lon_idx].T
-    
+
     return dict(x0=x, y0=y, x1=x1, y1=y1), dict(img=[bg_img])
 
 # --- Initialize Data Sources ---
@@ -123,22 +149,22 @@ p_xy = figure(width=900, height=600, match_aspect=True, x_axis_location='above',
               x_range=(min_lon, max_lon), y_range=(min_lat, max_lat), min_border_bottom=0)
 
 p_xy.image(image='img', x=min_lon, y=min_lat, dw=max_lon-min_lon, dh=max_lat-min_lat, source=source_xy_img, color_mapper=color_mapper, alpha=0.6)
-p_xy.segment(x0='x0', y0='y0', x1='x1', y1='y1', source=source_xy_vec, color="black", line_width=1.0) 
+p_xy.segment(x0='x0', y0='y0', x1='x1', y1='y1', source=source_xy_vec, color="black", line_width=1.0)
 p_xy.scatter(x='x0', y='y0', source=source_xy_vec, size=3, color="black", alpha=0.5)
 
 color_bar = ColorBar(color_mapper=color_mapper, title="Temp", location=(0,0))
 p_xy.add_layout(color_bar, 'left')
 
-p_xz = figure(x_axis_label="Longitude", y_axis_label="Depth (z)", 
-              width=900, height=450, 
+p_xz = figure(x_axis_label="Longitude", y_axis_label=z_label,
+              width=900, height=450,
               x_range=p_xy.x_range, y_range=(min_z, max_z), min_border_top=0)
 
 p_xz.image(image='img', x=min_lon, y=min_z, dw=max_lon-min_lon, dh=max_z-min_z, source=source_xz_img, color_mapper=color_mapper, alpha=0.6)
 p_xz.segment(x0='x0', y0='y0', x1='x1', y1='y1', source=source_xz_vec, color="black", line_width=1.0)
 p_xz.scatter(x='x0', y='y0', source=source_xz_vec, size=3, color="black", alpha=0.5)
 
-p_yz = figure(x_axis_label="Depth (z)", y_axis_label="Latitude", y_axis_location="right", 
-              width=450, height=600, 
+p_yz = figure(x_axis_label=z_label, y_axis_label="Latitude", y_axis_location="right",
+              width=450, height=600,
               x_range=(max_z, min_z), y_range=p_xy.y_range)
 
 p_yz.image(image='img', x=min_z, y=min_lat, dw=max_z-min_z, dh=max_lat-min_lat, source=source_yz_img, color_mapper=color_mapper, alpha=0.6)
@@ -168,7 +194,7 @@ p_yz.add_layout(span_yz_lat)
 # --- Sliders and Callbacks ---
 select_bg = Select(title="Background Variable:", value=init_bg_name, options=list(bg_options.keys()))
 
-slider_z = Slider(start=0, end=len(z)-1, value=len(z)-1, step=1, title="Depth Index (for Lat-Lon plot)")
+slider_z = Slider(start=0, end=len(z)-1, value=len(z)-1, step=1, title=f"{z_label} Index (for Lat-Lon plot)")
 slider_lat = Slider(start=0, end=len(lat)-1, value=len(lat) // 2, step=1, title="Latitude Index (for Lon-Z plot)")
 slider_lon = Slider(start=0, end=len(lon)-1, value=len(lon) // 2, step=1, title="Longitude Index (for Lat-Z plot)")
 
@@ -177,39 +203,30 @@ def update_plots(attr, old, new):
         z_idx = int(slider_z.value)
         lat_idx = int(slider_lat.value)
         lon_idx = int(slider_lon.value)
-        
-        # Determine which array to use based on dropdown
+
         bg_name = select_bg.value
         active_bg_array = bg_options[bg_name]
-        
-        # --- NEW: Dynamically swap colormap palettes ---
-        if bg_name == "Temperature (T)":
+
+        if bg_name == "Temperature (T)" or bg_name == "Mean SL Pressure":
             color_mapper.palette = Magma256
         else:
-            # Use RdBu11 for velocities. 
-            # Use RdBu11[::-1] if you prefer positive velocities to be Red instead of Blue
-            color_mapper.palette = PiYG11[::-1] 
-            
-        # Dynamically update the color mapper limits and ColorBar title
-        color_mapper.low, color_mapper.high = bg_limits[bg_name]
-        color_bar.title = bg_name.split(" ")[0] 
-        
-        # Pass the active array into the slice functions
-        vec_xy, img_xy = get_xy_slice(z_idx, active_bg_array)
-        
-        # Pass the active array into the slice functions
+            color_mapper.palette = PiYG11[::-1]
+
+        color_mapper.low, color_mapper.high = get_color_limits(bg_name, z_idx)
+        color_bar.title = bg_name.split(" ")[0]
+
         vec_xy, img_xy = get_xy_slice(z_idx, active_bg_array)
         vec_xz, img_xz = get_xz_slice(lat_idx, active_bg_array)
         vec_yz, img_yz = get_yz_slice(lon_idx, active_bg_array)
-        
+
         source_xy_vec.data = vec_xy
         source_xz_vec.data = vec_xz
         source_yz_vec.data = vec_yz
-        
+
         source_xy_img.data = img_xy
         source_xz_img.data = img_xz
         source_yz_img.data = img_yz
-        
+
         current_z, current_lat, current_lon = z[z_idx], lat[lat_idx], lon[lon_idx]
         span_xy_lon.location = current_lon
         span_xy_lat.location = current_lat
@@ -217,7 +234,7 @@ def update_plots(attr, old, new):
         span_xz_z.location = current_z
         span_yz_z.location = current_z
         span_yz_lat.location = current_lat
-        
+
     except Exception as e:
         print(f"Callback Error: {e}")
 
@@ -227,15 +244,14 @@ plot_grid = gridplot([
 ], toolbar_location="right")
 
 layout = column(
-    row(select_bg, slider_z, slider_lat, slider_lon), 
+    row(select_bg, slider_z, slider_lat, slider_lon),
     plot_grid
 )
 
-# Connect all widgets to the callback function
 select_bg.on_change('value', update_plots)
 slider_z.on_change('value', update_plots)
 slider_lat.on_change('value', update_plots)
 slider_lon.on_change('value', update_plots)
 
 curdoc().add_root(layout)
-curdoc().title = "3D Ocean Quiver Plots"
+curdoc().title = "3D Quiver Plots"

@@ -18,6 +18,8 @@ catch
     false
 end
 
+const directory = "/home/pt426/data/exo_ocean_sims"
+
 @inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, instellation, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_stress=nothing, initial_T=1.0, albedo=0.06)
 
     @info "Setting up simulation..."
@@ -150,7 +152,7 @@ end
 
     simulation.callbacks[:progress] = Callback(display_progress, IterationInterval(100))
 
-    output_filename = joinpath(@__DIR__, "runs", "$(simulation_name).nc")
+    output_filename = joinpath(directory, "ocean", "$(simulation_name).nc")
 
     simulation.output_writers[:full_3d] = NetCDFWriter(model, 
                                                     (; T=model.tracers.T, u=model.velocities.u, v=model.velocities.v, w=model.velocities.w), 
@@ -160,7 +162,7 @@ end
 
 
     # Automatically adapt the timestep to keep CFL at a safe 0.2
-    wizard = TimeStepWizard(cfl=0.2, max_change=1.05, max_Δt=1days)
+    wizard = TimeStepWizard(cfl=0.1, max_change=1.05, max_Δt=1days)
     simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
     @info "Simulation setup complete. Starting the run..."

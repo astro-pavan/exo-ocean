@@ -3,6 +3,8 @@ using Dates
 
 include("constants.jl")
 
+const directory = "/home/pt426/data/exo_ocean_sims"
+
 const _cuda_available = try
     using CUDA
     CUDA.functional()
@@ -27,8 +29,7 @@ end
 
 SpeedyWeather.initialize!(::NewtonianCooling, ::SpeedyWeather.AbstractModel) = nothing
 
-function SpeedyWeather.forcing!(diagn::SpeedyWeather.DiagnosticVariables,
-                                 progn::SpeedyWeather.PrognosticVariables,
+function SpeedyWeather.forcing!(vars::SpeedyWeather.Variables,
                                  F::NewtonianCooling,
                                  lf::Integer,
                                  model::SpeedyWeather.AbstractModel)
@@ -37,8 +38,8 @@ function SpeedyWeather.forcing!(diagn::SpeedyWeather.DiagnosticVariables,
     σ_full = model.geometry.σ_levels_full
     κ      = Float32(model.atmosphere.κ)   # R_dry / c_p ≈ 0.286
 
-    temp_grid = diagn.grid.temp_grid
-    dTdt      = diagn.tendencies.temp_tend_grid
+    temp_grid = vars.grid.temperature
+    dTdt      = vars.tendencies.grid.temperature
 
     for k in 1:size(temp_grid, 2)
         σ = σ_full[k]
@@ -94,16 +95,16 @@ function atmosphere_simulation(simulation_name, rotational_period, surface_press
                    gravity=Float32(gravity))
 
     # Reference surface pressure sets the column mass
-    atmosphere = EarthAtmosphere(spectral_grid, pres_ref=Float32(surface_pressure))
+    atmosphere = EarthDryAtmosphere(spectral_grid, reference_pressure=Float32(surface_pressure))
 
     # Newtonian cooling toward day/night equilibrium
     forcing = NewtonianCooling{Float32}(Float32(T_day), Float32(T_night), Float32(τ_rad))
 
     # Time-based output (SpeedyWeather uses wall-clock periods, not iteration counts)
     output = NetCDFOutput(spectral_grid, PrimitiveDryModel,
-                          path=joinpath(@__DIR__, "runs"),
+                          path=joinpath(directory, "atm"),
                           id=simulation_name,
-                          output_dt=Hour(output_dt))
+                          interval=Hour(output_dt))
 
     time_stepping = Leapfrog(spectral_grid, Δt_at_T31=Δt_at_T31)
     actual_Δt = time_stepping.Δt_millisec.value / 60000
@@ -118,8 +119,14 @@ function atmosphere_simulation(simulation_name, rotational_period, surface_press
                               forcing=forcing,
                               output=output,
                               time_stepping=time_stepping,
+                              initial_conditions=StartFromRest(spectral_grid),
+                              orography=NoOrography(spectral_grid),
+                              land_sea_mask=AquaPlanetMask(spectral_grid),
                               longwave_radiation=nothing,
-                              shortwave_radiation=nothing)
+                              shortwave_radiation=nothing,
+                              # verbose=true forces the progress bar on even when running
+                              # as a non-interactive script (Feedback's default is isinteractive())
+                              feedback=Feedback(verbose=true))
 
     simulation = initialize!(model)
 

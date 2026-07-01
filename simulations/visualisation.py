@@ -2,256 +2,383 @@ import simulation_reader
 
 import numpy as np
 from bokeh.plotting import figure
-from bokeh.models import ColumnDataSource, Slider, Span, LinearColorMapper, ColorBar, Select
+from bokeh.models import (
+    ColumnDataSource, Slider, Span, LinearColorMapper, ColorBar, Select,
+    CustomJSTickFormatter, BasicTickFormatter, BasicTicker, FixedTicker,
+)
 from bokeh.layouts import gridplot, column, row
 from bokeh.io import curdoc
-from bokeh.palettes import Magma256, RdBu11, PiYG11
+from bokeh.palettes import Magma256, PiYG11
 
-sim = simulation_reader.SimulationData('simulations/runs/run_atm_test_0008/output.nc')
-lon, lat, z, u, v, w, T = sim.lon, sim.lat, sim.z, sim.u, sim.v, sim.w, sim.T
 
-is_atmosphere = sim.sim_type == 'atmosphere'
-z_label = "Pressure Level (σ)" if is_atmosphere else "Depth (m)"
+def _expand_palette(hex_colors, n):
+    """Smoothly upsample a small hex palette to n colors via per-channel interpolation."""
+    stops = np.linspace(0, 1, len(hex_colors))
+    targets = np.linspace(0, 1, n)
+    rgb = np.array([[int(c[i:i + 2], 16) for i in (1, 3, 5)] for c in hex_colors])
+    out = np.stack([np.interp(targets, stops, rgb[:, ch]) for ch in range(3)], axis=1)
+    out = out.round().astype(int).clip(0, 255)
+    return tuple(f'#{r:02x}{g:02x}{b:02x}' for r, g, b in out)
 
-skip_xy = 1
-skip_z = 1
 
-lon_sub = lon[::skip_xy]
-lat_sub = lat[::skip_xy]
-z_sub = z[::skip_z]
+# Diverging (pink-white-green) scale for velocity/vorticity fields, smoothly
+# interpolated from the 11-stop Brewer palette up to 256 levels so nearby
+# values are distinguishable instead of being quantized into ~10 bins.
+VELOCITY_PALETTE = _expand_palette(PiYG11[::-1], 256)
 
-# Create 2D coordinate grids for all three planes
-Lon_xy, Lat_xy = np.meshgrid(lon_sub, lat_sub)
-Lon_xz, Z_xz = np.meshgrid(lon_sub, z_sub)
-Lat_yz, Z_yz = np.meshgrid(lat_sub, z_sub)
 
-min_lon, max_lon = np.min(lon), np.max(lon)
-min_lat, max_lat = np.min(lat), np.max(lat)
-min_z, max_z = np.min(z), np.max(z)
+class InteractivePlot:
+    FIG_W_XY, FIG_H_XY = 900, 600
+    FIG_W_XZ, FIG_H_XZ = 900, 450
+    FIG_W_YZ, FIG_H_YZ = 450, 600
 
-# Build bg_options dynamically — mslp is 2D so tile it to 3D for uniform slicing
-bg_options = {
-    "Temperature (T)": T,
-    "Zonal Velocity (u)": u,
-    "Meridional Velocity (v)": v,
-}
-if w is not None:
-    bg_options["Vertical Velocity (w)"] = w
-if sim.mslp is not None:
-    bg_options["Mean SL Pressure"] = np.tile(sim.mslp[np.newaxis, :, :], (len(z), 1, 1))
-if sim.vor is not None:
-    bg_options["Vorticity (vor)"] = sim.vor
+    # Fields shown on a zero-centered symmetric-log color scale rather than
+    # linearly, so small-magnitude motion isn't washed out by a few extreme
+    # values. Temperature/pressure stay linear since they aren't sign-symmetric.
+    DIVERGING_FIELDS = {
+        "Zonal Velocity (u)", "Meridional Velocity (v)",
+        "Vertical Velocity (w)", "Vorticity (vor)",
+    }
 
-# Pre-calculate min/max for all variables.
-# Velocities get symmetric limits (-max to +max) so 0 is exactly in the middle.
-# Temperature gets per-layer limits (list of (min, max) per z index) so small horizontal
-# contrasts at the surface aren't invisible compared to the large vertical temperature gradient.
-bg_limits = {}
-for name, arr in bg_options.items():
-    if name == "Temperature (T)":
-        # Store per-layer limits so the colormap adapts when the z slider moves
-        bg_limits[name] = [(np.nanmin(arr[k]), np.nanmax(arr[k])) for k in range(len(z))]
-    elif name == "Mean SL Pressure":
-        bg_limits[name] = (np.nanmin(arr), np.nanmax(arr))
-    elif name == "Vertical Velocity (w)":
-        max_abs = np.nanmax(np.abs(arr))
-        bg_limits[name] = (-max_abs / 20, max_abs / 20)
-    else:
-        max_abs = np.nanmax(np.abs(arr))
-        bg_limits[name] = (-max_abs, max_abs)
+    def __init__(self, sim_path):
+        sim = simulation_reader.SimulationData(sim_path)
+        self.lon, self.lat, self.z = sim.lon, sim.lat, sim.z
+        self.u, self.v, self.w, self.T = sim.u, sim.v, sim.w, sim.T
+        self.sim = sim
 
-def get_color_limits(bg_name, z_idx):
-    lims = bg_limits[bg_name]
-    if bg_name == "Temperature (T)":
-        return lims[z_idx]
-    return lims
+        self.is_atmosphere = sim.sim_type == 'atmosphere'
+        self.z_label = "Pressure Level (σ)" if self.is_atmosphere else "Depth (m)"
 
-init_bg_name = "Temperature (T)"
-init_z_idx = len(z) - 1
-init_limits = get_color_limits(init_bg_name, init_z_idx)
-color_mapper = LinearColorMapper(palette=Magma256, low=init_limits[0], high=init_limits[1])
+        self.skip_xy = 1
+        self.skip_z = 1
 
-def get_xy_slice(z_idx, bg_array):
-    """Lat-Lon plane (Main Plot)"""
-    u_sub = u[z_idx, ::skip_xy, ::skip_xy].flatten()
-    v_sub = v[z_idx, ::skip_xy, ::skip_xy].flatten()
-    x = Lon_xy.flatten()
-    y = Lat_xy.flatten()
+        self._build_grids()
+        self._build_bg_options()
+        self._build_bg_limits()
+        self._init_sources()
+        self._build_figures()
+        self._build_spans()
+        self._build_controls()
+        self._wire_callbacks()
 
-    scale = 5 / (np.sqrt(u_sub ** 2 + v_sub ** 2) + 1e-10)
+    def _build_grids(self):
+        lon_sub = self.lon[::self.skip_xy]
+        lat_sub = self.lat[::self.skip_xy]
+        z_sub   = self.z[::self.skip_z]
 
-    x1 = np.nan_to_num(x + (u_sub * scale), nan=x, posinf=x, neginf=x)
-    y1 = np.nan_to_num(y + (v_sub * scale), nan=y, posinf=y, neginf=y)
+        self.Lon_xy, self.Lat_xy = np.meshgrid(lon_sub, lat_sub)
+        self.Lon_xz, self.Z_xz  = np.meshgrid(lon_sub, z_sub)
+        self.Lat_yz, self.Z_yz  = np.meshgrid(lat_sub, z_sub)
 
-    bg_img = bg_array[z_idx, :, :]
+        self.min_lon, self.max_lon = np.min(self.lon), np.max(self.lon)
+        self.min_lat, self.max_lat = np.min(self.lat), np.max(self.lat)
+        self.min_z,   self.max_z   = np.min(self.z),   np.max(self.z)
 
-    return dict(x0=x, y0=y, x1=x1, y1=y1), dict(img=[bg_img])
+        # p_xz and p_yz aren't drawn with match_aspect=True, and their axes
+        # mix units of very different scale (e.g. longitude vs. sigma level),
+        # so a data-space arrow angle doesn't match the on-screen line slope.
+        # Correct for it using each subplot's pixel-per-data-unit ratio.
+        self.angle_scale_xz = (
+            self.FIG_W_XZ / (self.max_lon - self.min_lon),
+            self.FIG_H_XZ / (self.max_z - self.min_z),
+        )
+        self.angle_scale_yz = (
+            self.FIG_W_YZ / (self.min_z - self.max_z),
+            self.FIG_H_YZ / (self.max_lat - self.min_lat),
+        )
 
-def get_xz_slice(lat_idx, bg_array):
-    """Lon-Z plane (Bottom Plot)"""
-    u_sub = u[::skip_z, lat_idx, ::skip_xy].flatten()
-    x = Lon_xz.flatten()
-    y = Z_xz.flatten()
+    def _symlog(self, name, arr):
+        """Sign-preserving log transform: linear near zero, log beyond linthresh."""
+        abs_arr = np.abs(arr)
+        nonzero = abs_arr[abs_arr > 0]
+        linthresh = np.nanpercentile(nonzero, 5) if nonzero.size else 1.0
+        linthresh = max(linthresh, 1e-12)
+        self.bg_linthresh[name] = linthresh
+        self.bg_max_abs[name] = float(np.nanmax(abs_arr)) if abs_arr.size else 0.0
+        return np.sign(arr) * np.log1p(abs_arr / linthresh)
 
-    if w is not None:
-        w_sub = w[::skip_z, lat_idx, ::skip_xy].flatten()
-        w_scale_multiplier = 20 * np.mean(np.abs(u_sub)) / (np.mean(np.abs(w_sub)) + 1e-10)
-        scale = 20 / (np.sqrt((u_sub ** 2 + (w_sub * w_scale_multiplier) ** 2)) + 1e-10)
-        x1 = np.nan_to_num(x + (u_sub * scale), nan=x, posinf=x, neginf=x)
-        y1 = np.nan_to_num(y + (w_sub * scale * w_scale_multiplier), nan=y, posinf=y, neginf=y)
-    else:
-        scale = 5 / (np.abs(u_sub) + 1e-10)
-        x1 = np.nan_to_num(x + (u_sub * scale), nan=x, posinf=x, neginf=x)
-        y1 = y
+    @staticmethod
+    def _decade_tick_values(max_abs, linthresh, max_per_side=4):
+        """Nice round physical values (powers of ten, plus zero) spanning a symlog range."""
+        if max_abs <= 0:
+            return [0.0]
+        start_pow = np.floor(np.log10(max(linthresh, max_abs * 1e-6)))
+        end_pow = np.ceil(np.log10(max_abs))
+        decades = 10.0 ** np.arange(start_pow, end_pow + 1)
+        decades = decades[decades <= max_abs * 1.0001]
+        if len(decades) > max_per_side:
+            # keep the decades closest to the outer edge (most informative range)
+            decades = decades[-max_per_side:]
+        return sorted(set([0.0] + list(decades) + [-d for d in decades]))
 
-    bg_img = bg_array[:, lat_idx, :]
+    @staticmethod
+    def _format_tick_value(v):
+        if v == 0:
+            return "0"
+        exponent = int(np.floor(np.log10(abs(v))))
+        return f"{v:g}" if -3 <= exponent <= 3 else f"{v:.0e}"
 
-    return dict(x0=x, y0=y, x1=x1, y1=y1), dict(img=[bg_img])
+    def _symlog_ticker_formatter(self, max_abs, linthresh):
+        """Build a (ticker, formatter) pair placing ticks at nice round physical
+        values, positioned via the forward symlog transform. This makes the
+        log-scaled nature of the color bar visible (ticks bunch up away from
+        zero) rather than showing evenly-spaced positions with odd values."""
+        values = self._decade_tick_values(max_abs, linthresh)
+        positions = [float(np.sign(v) * np.log1p(abs(v) / linthresh)) for v in values]
+        labels = [self._format_tick_value(v) for v in values]
+        ticker = FixedTicker(ticks=positions)
+        formatter = CustomJSTickFormatter(
+            args=dict(positions=positions, labels=labels),
+            code="""
+                let best = 0, best_dist = Infinity;
+                for (let i = 0; i < positions.length; i++) {
+                    const d = Math.abs(positions[i] - tick);
+                    if (d < best_dist) { best_dist = d; best = i; }
+                }
+                return labels[best];
+            """,
+        )
+        return ticker, formatter
 
-def get_yz_slice(lon_idx, bg_array):
-    """Lat-Z plane (Right Plot) - Flipped Axes"""
-    v_sub = v[::skip_z, ::skip_xy, lon_idx].flatten()
-    x = Z_yz.flatten()
-    y = Lat_yz.flatten()
+    def _build_bg_options(self):
+        self.bg_linthresh = {}
+        self.bg_max_abs = {}
+        self.bg_options = {
+            "Temperature (T)":       self.T,
+            "Zonal Velocity (u)":    self._symlog("Zonal Velocity (u)", self.u),
+            "Meridional Velocity (v)": self._symlog("Meridional Velocity (v)", self.v),
+        }
+        if self.w is not None:
+            self.bg_options["Vertical Velocity (w)"] = self._symlog("Vertical Velocity (w)", self.w)
+        if self.sim.mslp is not None:
+            self.bg_options["Mean SL Pressure"] = np.tile(
+                self.sim.mslp[np.newaxis, :, :], (len(self.z), 1, 1)
+            )
+        if self.sim.vor is not None:
+            self.bg_options["Vorticity (vor)"] = self._symlog("Vorticity (vor)", self.sim.vor)
 
-    if w is not None:
-        w_sub = w[::skip_z, ::skip_xy, lon_idx].flatten()
-        w_scale_multiplier = 20 * np.mean(np.abs(v_sub)) / (np.mean(np.abs(w_sub)) + 1e-10)
-        scale = 20 / (np.sqrt((v_sub ** 2 + (w_sub * w_scale_multiplier) ** 2)) + 1e-10)
-        x1 = np.nan_to_num(x + (w_sub * scale * w_scale_multiplier), nan=x, posinf=x, neginf=x)
-        y1 = np.nan_to_num(y + (v_sub * scale), nan=y, posinf=y, neginf=y)
-    else:
-        scale = 5 / (np.abs(v_sub) + 1e-10)
-        x1 = x
-        y1 = np.nan_to_num(y + (v_sub * scale), nan=y, posinf=y, neginf=y)
+    def _build_bg_limits(self):
+        self.bg_limits = {}
+        for name, arr in self.bg_options.items():
+            if name == "Temperature (T)":
+                self.bg_limits[name] = [
+                    (np.nanmin(arr[k]), np.nanmax(arr[k])) for k in range(len(self.z))
+                ]
+            elif name == "Mean SL Pressure":
+                self.bg_limits[name] = (np.nanmin(arr), np.nanmax(arr))
+            else:
+                # already symlog-transformed and zero-centered
+                max_abs = np.nanmax(np.abs(arr))
+                self.bg_limits[name] = (-max_abs, max_abs)
 
-    bg_img = bg_array[:, :, lon_idx].T
+    def _get_color_limits(self, bg_name, z_idx):
+        lims = self.bg_limits[bg_name]
+        if bg_name == "Temperature (T)":
+            return lims[z_idx]
+        return lims
 
-    return dict(x0=x, y0=y, x1=x1, y1=y1), dict(img=[bg_img])
+    def _get_xy_slice(self, z_idx, bg_array):
+        u_sub = self.u[z_idx, ::self.skip_xy, ::self.skip_xy].flatten()
+        v_sub = self.v[z_idx, ::self.skip_xy, ::self.skip_xy].flatten()
+        x = self.Lon_xy.flatten()
+        y = self.Lat_xy.flatten()
+        scale = 5 / (np.sqrt(u_sub ** 2 + v_sub ** 2) + 1e-10)
+        x1 = np.nan_to_num(x + u_sub * scale, nan=x, posinf=x, neginf=x)
+        y1 = np.nan_to_num(y + v_sub * scale, nan=y, posinf=y, neginf=y)
+        angle = np.arctan2(-(x1 - x), y1 - y)
+        return dict(x0=x, y0=y, x1=x1, y1=y1, angle=angle), dict(img=[bg_array[z_idx, :, :]])
 
-# --- Initialize Data Sources ---
-current_bg_array = bg_options[init_bg_name]
-
-vec_xy, img_xy = get_xy_slice(len(z)-1, current_bg_array)
-source_xy_vec = ColumnDataSource(data=vec_xy)
-source_xy_img = ColumnDataSource(data=img_xy)
-
-vec_xz, img_xz = get_xz_slice(len(lat) // 2, current_bg_array)
-source_xz_vec = ColumnDataSource(data=vec_xz)
-source_xz_img = ColumnDataSource(data=img_xz)
-
-vec_yz, img_yz = get_yz_slice(len(lon) // 2, current_bg_array)
-source_yz_vec = ColumnDataSource(data=vec_yz)
-source_yz_img = ColumnDataSource(data=img_yz)
-
-# --- Build Figures & Add Images ---
-p_xy = figure(width=900, height=600, match_aspect=True, x_axis_location='above',
-              x_range=(min_lon, max_lon), y_range=(min_lat, max_lat), min_border_bottom=0)
-
-p_xy.image(image='img', x=min_lon, y=min_lat, dw=max_lon-min_lon, dh=max_lat-min_lat, source=source_xy_img, color_mapper=color_mapper, alpha=0.6)
-p_xy.segment(x0='x0', y0='y0', x1='x1', y1='y1', source=source_xy_vec, color="black", line_width=1.0)
-p_xy.scatter(x='x0', y='y0', source=source_xy_vec, size=3, color="black", alpha=0.5)
-
-color_bar = ColorBar(color_mapper=color_mapper, title="Temp", location=(0,0))
-p_xy.add_layout(color_bar, 'left')
-
-p_xz = figure(x_axis_label="Longitude", y_axis_label=z_label,
-              width=900, height=450,
-              x_range=p_xy.x_range, y_range=(min_z, max_z), min_border_top=0)
-
-p_xz.image(image='img', x=min_lon, y=min_z, dw=max_lon-min_lon, dh=max_z-min_z, source=source_xz_img, color_mapper=color_mapper, alpha=0.6)
-p_xz.segment(x0='x0', y0='y0', x1='x1', y1='y1', source=source_xz_vec, color="black", line_width=1.0)
-p_xz.scatter(x='x0', y='y0', source=source_xz_vec, size=3, color="black", alpha=0.5)
-
-p_yz = figure(x_axis_label=z_label, y_axis_label="Latitude", y_axis_location="right",
-              width=450, height=600,
-              x_range=(max_z, min_z), y_range=p_xy.y_range)
-
-p_yz.image(image='img', x=min_z, y=min_lat, dw=max_z-min_z, dh=max_lat-min_lat, source=source_yz_img, color_mapper=color_mapper, alpha=0.6)
-p_yz.segment(x0='x0', y0='y0', x1='x1', y1='y1', source=source_yz_vec, color="black", line_width=1.0)
-p_yz.scatter(x='x0', y='y0', source=source_yz_vec, size=3, color="black", alpha=0.5)
-
-# --- Spans ---
-init_z = z[-1]
-init_lat = lat[len(lat) // 2]
-init_lon = lon[len(lon) // 2]
-
-span_xy_lon = Span(location=init_lon, dimension='height', line_color='black', line_dash='dashed', line_width=1.5)
-span_xy_lat = Span(location=init_lat, dimension='width', line_color='black', line_dash='dashed', line_width=1.5)
-p_xy.add_layout(span_xy_lon)
-p_xy.add_layout(span_xy_lat)
-
-span_xz_lon = Span(location=init_lon, dimension='height', line_color='black', line_dash='dashed', line_width=1.5)
-span_xz_z = Span(location=init_z, dimension='width', line_color='black', line_dash='dashed', line_width=1.5)
-p_xz.add_layout(span_xz_lon)
-p_xz.add_layout(span_xz_z)
-
-span_yz_z = Span(location=init_z, dimension='height', line_color='black', line_dash='dashed', line_width=1.5)
-span_yz_lat = Span(location=init_lat, dimension='width', line_color='black', line_dash='dashed', line_width=1.5)
-p_yz.add_layout(span_yz_z)
-p_yz.add_layout(span_yz_lat)
-
-# --- Sliders and Callbacks ---
-select_bg = Select(title="Background Variable:", value=init_bg_name, options=list(bg_options.keys()))
-
-slider_z = Slider(start=0, end=len(z)-1, value=len(z)-1, step=1, title=f"{z_label} Index (for Lat-Lon plot)")
-slider_lat = Slider(start=0, end=len(lat)-1, value=len(lat) // 2, step=1, title="Latitude Index (for Lon-Z plot)")
-slider_lon = Slider(start=0, end=len(lon)-1, value=len(lon) // 2, step=1, title="Longitude Index (for Lat-Z plot)")
-
-def update_plots(attr, old, new):
-    try:
-        z_idx = int(slider_z.value)
-        lat_idx = int(slider_lat.value)
-        lon_idx = int(slider_lon.value)
-
-        bg_name = select_bg.value
-        active_bg_array = bg_options[bg_name]
-
-        if bg_name == "Temperature (T)" or bg_name == "Mean SL Pressure":
-            color_mapper.palette = Magma256
+    def _get_xz_slice(self, lat_idx, bg_array):
+        u_sub = self.u[::self.skip_z, lat_idx, ::self.skip_xy].flatten()
+        x = self.Lon_xz.flatten()
+        y = self.Z_xz.flatten()
+        if self.w is not None:
+            w_sub   = self.w[::self.skip_z, lat_idx, ::self.skip_xy].flatten()
+            w_scale = 20 * np.mean(np.abs(u_sub)) / (np.mean(np.abs(w_sub)) + 1e-10)
+            scale   = 20 / (np.sqrt(u_sub ** 2 + (w_sub * w_scale) ** 2) + 1e-10)
+            x1 = np.nan_to_num(x + u_sub * scale,           nan=x, posinf=x, neginf=x)
+            y1 = np.nan_to_num(y + w_sub * scale * w_scale, nan=y, posinf=y, neginf=y)
         else:
-            color_mapper.palette = PiYG11[::-1]
+            scale = 5 / (np.abs(u_sub) + 1e-10)
+            x1 = np.nan_to_num(x + u_sub * scale, nan=x, posinf=x, neginf=x)
+            y1 = y
+        sx, sy = self.angle_scale_xz
+        angle = np.arctan2(-(x1 - x) * sx, (y1 - y) * sy)
+        return dict(x0=x, y0=y, x1=x1, y1=y1, angle=angle), dict(img=[bg_array[:, lat_idx, :]])
 
-        color_mapper.low, color_mapper.high = get_color_limits(bg_name, z_idx)
-        color_bar.title = bg_name.split(" ")[0]
+    def _get_yz_slice(self, lon_idx, bg_array):
+        v_sub = self.v[::self.skip_z, ::self.skip_xy, lon_idx].flatten()
+        x = self.Z_yz.flatten()
+        y = self.Lat_yz.flatten()
+        if self.w is not None:
+            w_sub   = self.w[::self.skip_z, ::self.skip_xy, lon_idx].flatten()
+            w_scale = 20 * np.mean(np.abs(v_sub)) / (np.mean(np.abs(w_sub)) + 1e-10)
+            scale   = 20 / (np.sqrt(v_sub ** 2 + (w_sub * w_scale) ** 2) + 1e-10)
+            x1 = np.nan_to_num(x + w_sub * scale * w_scale, nan=x, posinf=x, neginf=x)
+            y1 = np.nan_to_num(y + v_sub * scale,           nan=y, posinf=y, neginf=y)
+        else:
+            scale = 5 / (np.abs(v_sub) + 1e-10)
+            x1 = x
+            y1 = np.nan_to_num(y + v_sub * scale, nan=y, posinf=y, neginf=y)
+        sx, sy = self.angle_scale_yz
+        angle = np.arctan2(-(x1 - x) * sx, (y1 - y) * sy)
+        return dict(x0=x, y0=y, x1=x1, y1=y1, angle=angle), dict(img=[bg_array[:, :, lon_idx].T])
 
-        vec_xy, img_xy = get_xy_slice(z_idx, active_bg_array)
-        vec_xz, img_xz = get_xz_slice(lat_idx, active_bg_array)
-        vec_yz, img_yz = get_yz_slice(lon_idx, active_bg_array)
+    def _init_sources(self):
+        init_bg_name = "Temperature (T)"
+        init_z_idx   = len(self.z) - 1
+        lo, hi = self._get_color_limits(init_bg_name, init_z_idx)
+        self.color_mapper = LinearColorMapper(palette=Magma256, low=lo, high=hi)
 
-        source_xy_vec.data = vec_xy
-        source_xz_vec.data = vec_xz
-        source_yz_vec.data = vec_yz
+        bg = self.bg_options[init_bg_name]
+        vec_xy, img_xy = self._get_xy_slice(init_z_idx, bg)
+        vec_xz, img_xz = self._get_xz_slice(len(self.lat) // 2, bg)
+        vec_yz, img_yz = self._get_yz_slice(len(self.lon) // 2, bg)
 
-        source_xy_img.data = img_xy
-        source_xz_img.data = img_xz
-        source_yz_img.data = img_yz
+        self.source_xy_vec = ColumnDataSource(data=vec_xy)
+        self.source_xy_img = ColumnDataSource(data=img_xy)
+        self.source_xz_vec = ColumnDataSource(data=vec_xz)
+        self.source_xz_img = ColumnDataSource(data=img_xz)
+        self.source_yz_vec = ColumnDataSource(data=vec_yz)
+        self.source_yz_img = ColumnDataSource(data=img_yz)
 
-        current_z, current_lat, current_lon = z[z_idx], lat[lat_idx], lon[lon_idx]
-        span_xy_lon.location = current_lon
-        span_xy_lat.location = current_lat
-        span_xz_lon.location = current_lon
-        span_xz_z.location = current_z
-        span_yz_z.location = current_z
-        span_yz_lat.location = current_lat
+    def _build_figures(self):
+        ml, xl = self.min_lon, self.max_lon
+        mla, xla = self.min_lat, self.max_lat
+        mz, xz = self.min_z, self.max_z
+        cm = self.color_mapper
 
-    except Exception as e:
-        print(f"Callback Error: {e}")
+        self.p_xy = figure(
+            width=self.FIG_W_XY, height=self.FIG_H_XY, match_aspect=True, x_axis_location='above',
+            x_range=(ml, xl), y_range=(mla, xla), min_border_bottom=0,
+        )
+        self.p_xy.image(image='img', x=ml, y=mla, dw=xl-ml, dh=xla-mla,
+                        source=self.source_xy_img, color_mapper=cm, alpha=0.6)
+        self.p_xy.segment(x0='x0', y0='y0', x1='x1', y1='y1',
+                          source=self.source_xy_vec, color="black", line_width=1.0)
+        self.p_xy.scatter(x='x1', y='y1', source=self.source_xy_vec, marker="triangle",
+                          angle='angle', size=6, color="black", alpha=0.5)
+        self.linear_ticker = BasicTicker()
+        self.linear_formatter = BasicTickFormatter()
+        self.color_bar = ColorBar(color_mapper=cm, title="Temp", location=(0, 0),
+                                   ticker=self.linear_ticker, formatter=self.linear_formatter)
+        self.p_xy.add_layout(self.color_bar, 'left')
 
-plot_grid = gridplot([
-    [p_xy, p_yz],
-    [p_xz, None]
-], toolbar_location="right")
+        self.p_xz = figure(
+            x_axis_label="Longitude", y_axis_label=self.z_label,
+            width=self.FIG_W_XZ, height=self.FIG_H_XZ,
+            x_range=self.p_xy.x_range, y_range=(mz, xz), min_border_top=0,
+        )
+        self.p_xz.image(image='img', x=ml, y=mz, dw=xl-ml, dh=xz-mz,
+                        source=self.source_xz_img, color_mapper=cm, alpha=0.6)
+        self.p_xz.segment(x0='x0', y0='y0', x1='x1', y1='y1',
+                          source=self.source_xz_vec, color="black", line_width=1.0)
+        self.p_xz.scatter(x='x1', y='y1', source=self.source_xz_vec, marker="triangle",
+                          angle='angle', size=6, color="black", alpha=0.5)
 
-layout = column(
-    row(select_bg, slider_z, slider_lat, slider_lon),
-    plot_grid
-)
+        self.p_yz = figure(
+            x_axis_label=self.z_label, y_axis_label="Latitude", y_axis_location="right",
+            width=self.FIG_W_YZ, height=self.FIG_H_YZ,
+            x_range=(xz, mz), y_range=self.p_xy.y_range,
+        )
+        self.p_yz.image(image='img', x=mz, y=mla, dw=xz-mz, dh=xla-mla,
+                        source=self.source_yz_img, color_mapper=cm, alpha=0.6)
+        self.p_yz.segment(x0='x0', y0='y0', x1='x1', y1='y1',
+                          source=self.source_yz_vec, color="black", line_width=1.0)
+        self.p_yz.scatter(x='x1', y='y1', source=self.source_yz_vec, marker="triangle",
+                          angle='angle', size=6, color="black", alpha=0.5)
 
-select_bg.on_change('value', update_plots)
-slider_z.on_change('value', update_plots)
-slider_lat.on_change('value', update_plots)
-slider_lon.on_change('value', update_plots)
+    def _build_spans(self):
+        init_z   = self.z[-1]
+        init_lat = self.lat[len(self.lat) // 2]
+        init_lon = self.lon[len(self.lon) // 2]
 
-curdoc().add_root(layout)
+        self.span_xy_lon = Span(location=init_lon, dimension='height', line_color='black', line_dash='dashed', line_width=1.5)
+        self.span_xy_lat = Span(location=init_lat, dimension='width',  line_color='black', line_dash='dashed', line_width=1.5)
+        self.p_xy.add_layout(self.span_xy_lon)
+        self.p_xy.add_layout(self.span_xy_lat)
+
+        self.span_xz_lon = Span(location=init_lon, dimension='height', line_color='black', line_dash='dashed', line_width=1.5)
+        self.span_xz_z   = Span(location=init_z,   dimension='width',  line_color='black', line_dash='dashed', line_width=1.5)
+        self.p_xz.add_layout(self.span_xz_lon)
+        self.p_xz.add_layout(self.span_xz_z)
+
+        self.span_yz_z   = Span(location=init_z,   dimension='height', line_color='black', line_dash='dashed', line_width=1.5)
+        self.span_yz_lat = Span(location=init_lat, dimension='width',  line_color='black', line_dash='dashed', line_width=1.5)
+        self.p_yz.add_layout(self.span_yz_z)
+        self.p_yz.add_layout(self.span_yz_lat)
+
+    def _build_controls(self):
+        self.select_bg = Select(
+            title="Background Variable:",
+            value="Temperature (T)",
+            options=list(self.bg_options.keys()),
+        )
+        self.slider_z   = Slider(start=0, end=len(self.z)-1,   value=len(self.z)-1,      step=1, title=f"{self.z_label} Index (for Lat-Lon plot)")
+        self.slider_lat = Slider(start=0, end=len(self.lat)-1, value=len(self.lat) // 2, step=1, title="Latitude Index (for Lon-Z plot)")
+        self.slider_lon = Slider(start=0, end=len(self.lon)-1, value=len(self.lon) // 2, step=1, title="Longitude Index (for Lat-Z plot)")
+
+    def _wire_callbacks(self):
+        for widget in (self.select_bg, self.slider_z, self.slider_lat, self.slider_lon):
+            widget.on_change('value', self._update_plots)
+
+    def _update_plots(self, attr, old, new):
+        try:
+            z_idx   = int(self.slider_z.value)
+            lat_idx = int(self.slider_lat.value)
+            lon_idx = int(self.slider_lon.value)
+
+            bg_name  = self.select_bg.value
+            bg_array = self.bg_options[bg_name]
+
+            self.color_mapper.low, self.color_mapper.high = self._get_color_limits(bg_name, z_idx)
+
+            if bg_name in ("Temperature (T)", "Mean SL Pressure"):
+                self.color_mapper.palette = Magma256
+                self.color_bar.ticker = self.linear_ticker
+                self.color_bar.formatter = self.linear_formatter
+            else:
+                self.color_mapper.palette = VELOCITY_PALETTE
+                ticker, formatter = self._symlog_ticker_formatter(
+                    self.bg_max_abs[bg_name], self.bg_linthresh[bg_name]
+                )
+                self.color_bar.ticker = ticker
+                self.color_bar.formatter = formatter
+            self.color_bar.title = bg_name.split(" ")[0]
+
+            vec_xy, img_xy = self._get_xy_slice(z_idx, bg_array)
+            vec_xz, img_xz = self._get_xz_slice(lat_idx, bg_array)
+            vec_yz, img_yz = self._get_yz_slice(lon_idx, bg_array)
+
+            self.source_xy_vec.data = vec_xy
+            self.source_xz_vec.data = vec_xz
+            self.source_yz_vec.data = vec_yz
+            self.source_xy_img.data = img_xy
+            self.source_xz_img.data = img_xz
+            self.source_yz_img.data = img_yz
+
+            self.span_xy_lon.location = self.lon[lon_idx]
+            self.span_xy_lat.location = self.lat[lat_idx]
+            self.span_xz_lon.location = self.lon[lon_idx]
+            self.span_xz_z.location   = self.z[z_idx]
+            self.span_yz_z.location   = self.z[z_idx]
+            self.span_yz_lat.location = self.lat[lat_idx]
+
+        except Exception as e:
+            print(f"Callback Error: {e}")
+
+    def get_layout(self):
+        plot_grid = gridplot(
+            [[self.p_xy, self.p_yz], [self.p_xz, None]],
+            toolbar_location="right",
+        )
+        return column(
+            row(self.select_bg, self.slider_z, self.slider_lat, self.slider_lon),
+            plot_grid,
+        )
+
+
+interactive_plot = InteractivePlot('exo_ocean_sims/atm/run_atm_coriolis_4_0001/output.nc')
+
+curdoc().add_root(interactive_plot.get_layout())
 curdoc().title = "3D Quiver Plots"

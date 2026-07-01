@@ -1,31 +1,51 @@
+include("constants.jl")
 using Oceananigans
 using Oceananigans.Units
 using NCDatasets
 using Oceananigans.Diagnostics: AdvectiveCFL
 using Statistics
-using CUDA
+const _cuda_available = try
+    using CUDA
+    CUDA.functional()
+catch
+    false
+end
 
-const omega_Earth = 7.29e-5 # 1 rotation per day in rad/s
-const R_Earth = 6371000 # m
-const solar_constant = 1361 # W/m^2
-
-const rho_seawater = 1026 # kg/m^3
-const rho_air = 1.2 # kg/m^3
-const C_D_wind = 0.002
-
-const C_Bottom_Drag = 2e-3
-const cp_seawater = 3994.0  # J/(kg·K)
+const _amdgpu_available = !_cuda_available && try
+    using AMDGPU
+    AMDGPU.functional()
+catch
+    false
+end
 
 @inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, instellation, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_stress=nothing, initial_T=1.0, albedo=0.06)
 
-    arch = use_GPU ? GPU() : CPU()
+    @info "Setting up simulation..."
 
-    # Grid
+    arch = if !use_GPU
+        CPU()
+    elseif _cuda_available
+        @info "CUDA GPU detected, using CUDA backend."
+        GPU()
+    elseif _amdgpu_available
+        @info "AMD GPU detected, using AMDGPU backend."
+        GPU()
+    else
+        @warn "No functional GPU found, falling back to CPU."
+        CPU()
+    end
+
+    # Grid — exponential stretching with constant ratio r between adjacent cells.
+    # Δz₀ is derived so the faces span exactly ocean_depth.
+    r = 1.2
+    Δz₀ = ocean_depth * (r - 1) / (r^n_depth - 1)
+    z_faces = [-Δz₀ * (r^(n_depth - k) - 1) / (r - 1) for k in 0:n_depth]
+
     grid = LatitudeLongitudeGrid(arch, Float32,
                                 size = (n_lon, n_lat, n_depth),
                                 longitude = (-180, 180),
                                 latitude = (-80, 80),
-                                z = (-ocean_depth, 0),
+                                z = z_faces,
                                 radius = planet_radius,
                                 topology = (Periodic, Bounded, Bounded))
 
@@ -90,7 +110,7 @@ const cp_seawater = 3994.0  # J/(kg·K)
 
     # Diffusivity
     convective_adjustment = ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0)
-    background_diffusivity = (VerticalScalarDiffusivity(ν=1e-4, κ=1e-4), HorizontalScalarDiffusivity(ν=1e4, κ=1e4))
+    background_diffusivity = (VerticalScalarDiffusivity(ν=1e-4, κ=1e-4), HorizontalScalarDiffusivity(ν=1e5, κ=1e4))
     closure = (background_diffusivity..., convective_adjustment)
 
     model = HydrostaticFreeSurfaceModel(grid,

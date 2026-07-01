@@ -1,5 +1,5 @@
-# import Pkg; Pkg.activate(joinpath(@__DIR__, ".."))
 include("ocean_sim.jl")
+include("constants.jl")
 using Oceananigans.Units
 
 const solar_constant = 1361.0  # W/m²

@@ -1,0 +1,134 @@
+using SpeedyWeather
+using Dates
+
+include("constants.jl")
+
+const _cuda_available = try
+    using CUDA
+    CUDA.functional()
+catch
+    false
+end
+
+const _amdgpu_available = !_cuda_available && try
+    using AMDGPU
+    AMDGPU.functional()
+catch
+    false
+end
+
+# Newtonian cooling toward a tidally-locked day/night equilibrium temperature.
+# Hottest at the substellar point (lon=0°, lat=0°), coldest at the antistellar point.
+struct NewtonianCooling{NF<:AbstractFloat} <: SpeedyWeather.AbstractForcing
+    T_day::NF    # equilibrium temperature at substellar point [K]
+    T_night::NF  # equilibrium temperature at antistellar point [K]
+    τ_rad::NF    # radiative relaxation timescale [s]
+end
+
+SpeedyWeather.initialize!(::NewtonianCooling, ::SpeedyWeather.AbstractModel) = nothing
+
+function SpeedyWeather.forcing!(diagn::SpeedyWeather.DiagnosticVariables,
+                                 progn::SpeedyWeather.PrognosticVariables,
+                                 F::NewtonianCooling,
+                                 lf::Integer,
+                                 model::SpeedyWeather.AbstractModel)
+    londs  = model.geometry.londs
+    latds  = model.geometry.latds
+    σ_full = model.geometry.σ_levels_full
+    κ      = Float32(model.atmosphere.κ)   # R_dry / c_p ≈ 0.286
+
+    temp_grid = diagn.grid.temp_grid
+    dTdt      = diagn.tendencies.temp_tend_grid
+
+    for k in 1:size(temp_grid, 2)
+        σ = σ_full[k]
+        for ij in 1:size(temp_grid, 1)
+            lon_rad = londs[ij] * π / 180f0
+            lat_rad = latds[ij] * π / 180f0
+            # Surface equilibrium: full day/night contrast at σ = 1
+            T_eq_surf = F.T_night + (F.T_day - F.T_night) * max(0f0, cos(lon_rad) * cos(lat_rad))
+            # Scale with height: dry-adiabatic profile T_eq ∝ σ^κ, floor at 200 K
+            # This puts the stellar heating at the surface and keeps the stratosphere cold,
+            # so the upper atmosphere does not fight the surface contrast.
+            T_eq = max(200f0, T_eq_surf * σ^κ)
+            dTdt[ij, k] -= (temp_grid[ij, k] - T_eq) / F.τ_rad
+        end
+    end
+end
+
+function atmosphere_simulation(simulation_name, rotational_period, surface_pressure, planet_radius, T_day, T_night, simulation_time;
+    n_lat=90, n_levels=8, use_GPU=false, output_dt=6,
+    gravity=g_Earth, τ_rad=259200.0,  # 3 days; 10-day default was too slow vs ~4-day dynamical timescale
+    # SpeedyWeather's built-in default is Minute(40), which scales to 160min at T7.
+    # Reduce this if you see NaN warnings — typically needed for no-rotation cases
+    # or large day/night temperature contrasts (>80 K) where winds can be very fast.
+    Δt_at_T31=Minute(20))
+
+    @info "Setting up atmosphere simulation..."
+
+    # SpeedyWeather GPU support via architecture keyword
+    architecture = if use_GPU && _cuda_available
+        @info "CUDA GPU detected, using CUDA backend."
+        GPU()
+    elseif use_GPU && _amdgpu_available
+        @info "AMD GPU detected, using AMDGPU backend."
+        GPU()
+    else
+        use_GPU && @warn "No functional GPU found, falling back to CPU."
+        CPU()
+    end
+
+    # Spectral truncation T ≈ n_lat / 3 (e.g. n_lat=90 → T30)
+    trunc = round(Int, n_lat / 3)
+
+    spectral_grid = SpectralGrid(trunc=trunc, nlayers=n_levels, NF=Float32,
+                                 architecture=architecture)
+
+    # Planet: rotation rate uses the same convention as ocean_sim.jl
+    # (rotational_period=1 → Earth-like, 0 → no rotation)
+    rotation_rate = rotational_period == 0 ? 0f0 : Float32(omega_Earth / rotational_period)
+
+    planet = Earth(spectral_grid,
+                   rotation=rotation_rate,
+                   radius=Float32(planet_radius),
+                   gravity=Float32(gravity))
+
+    # Reference surface pressure sets the column mass
+    atmosphere = EarthAtmosphere(spectral_grid, pres_ref=Float32(surface_pressure))
+
+    # Newtonian cooling toward day/night equilibrium
+    forcing = NewtonianCooling{Float32}(Float32(T_day), Float32(T_night), Float32(τ_rad))
+
+    # Time-based output (SpeedyWeather uses wall-clock periods, not iteration counts)
+    output = NetCDFOutput(spectral_grid, PrimitiveDryModel,
+                          path=joinpath(@__DIR__, "runs"),
+                          id=simulation_name,
+                          output_dt=Hour(output_dt))
+
+    time_stepping = Leapfrog(spectral_grid, Δt_at_T31=Δt_at_T31)
+    actual_Δt = time_stepping.Δt_millisec.value / 60000
+    @info "Time step: $(round(actual_Δt, digits=1)) min at T$(trunc)"
+
+    # Disable SpeedyWeather's built-in radiation: JeevanjeeRadiation cools toward 200 K
+    # and TransparentShortwave adds solar input — both conflict with our Newtonian cooling,
+    # which already encodes the net day/night radiative balance.
+    model = PrimitiveDryModel(spectral_grid;
+                              planet=planet,
+                              atmosphere=atmosphere,
+                              forcing=forcing,
+                              output=output,
+                              time_stepping=time_stepping,
+                              longwave_radiation=nothing,
+                              shortwave_radiation=nothing)
+
+    simulation = initialize!(model)
+
+    # simulation_time is in seconds (consistent with ocean_sim.jl convention)
+    period = Second(round(Int, simulation_time))
+
+    @info "Atmosphere simulation setup complete. Starting the run..."
+    run!(simulation, period=period, output=true)
+    @info "Atmosphere simulation finished successfully!"
+
+    return nothing
+end

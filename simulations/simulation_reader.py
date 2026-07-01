@@ -110,10 +110,12 @@ class SimulationData:
         self.z    = np.array(ds['layer'])   # sigma pressure levels (0–1)
         self.u    = np.array(u_raw)
         self.v    = np.array(v_raw)
-        self.w    = None                    # not output by SpeedyWeather
         self.T    = np.array(T_raw)
         self.mslp = np.array(ds['mslp'].isel(time=slice(-10, None)).mean(dim='time').squeeze()) if 'mslp' in ds else None
         self.vor  = np.array(ds['vor'].isel(time=slice(-10, None)).mean(dim='time').squeeze())  if 'vor'  in ds else None
+
+        # Derive vertical velocity in sigma coordinates from horizontal divergence
+        self.w = self._compute_sigma_dot()
 
         print('---- SHAPES ----')
         self._print_shapes()
@@ -124,6 +126,7 @@ class SimulationData:
             self.z   = rebin(self.z,   [1])
             self.u   = rebin(self.u,   [1, 2, 1])
             self.v   = rebin(self.v,   [1, 2, 1])
+            self.w   = rebin(self.w,   [1, 2, 1])
             self.T   = rebin(self.T,   [1, 2, 1])
             if self.mslp is not None:
                 self.mslp = rebin(self.mslp, [2, 1])
@@ -132,6 +135,46 @@ class SimulationData:
 
             print('-- NEW SHAPES --')
             self._print_shapes()
+
+    def _compute_sigma_dot(self):
+        """Estimate vertical velocity in sigma coordinates from the continuity equation.
+
+        sigma_dot(sigma) = -integral_0^sigma div_h dsigma'
+        div_h = (1 / (R cos phi)) * (du/dlambda + d(v cos phi)/dphi)
+
+        Returns w with sign convention: positive = upward (decreasing sigma),
+        negative = downward, matching the ocean w convention used by the visualisation.
+        Shape: (n_layer, n_lat, n_lon).
+        """
+        R = 6.371e6  # Earth radius, m
+        lon_r = np.radians(self.lon)   # (n_lon,)  uniform spacing assumed
+        lat_r = np.radians(self.lat)   # (n_lat,)  N→S (decreasing)
+        cos_lat = np.cos(lat_r)        # (n_lat,)
+
+        # Zonal derivative with periodic longitude wrap
+        dlon = lon_r[1] - lon_r[0]
+        du_dlon = (np.roll(self.u, -1, axis=2) - np.roll(self.u, 1, axis=2)) / (2 * dlon)
+
+        # Meridional derivative of (v * cos lat); np.gradient handles non-uniform spacing
+        v_cos = self.v * cos_lat[np.newaxis, :, np.newaxis]
+        dv_cos_dlat = np.gradient(v_cos, lat_r, axis=1)
+
+        # Horizontal divergence; guard against cos→0 at exact poles
+        cos_safe = np.where(np.abs(cos_lat) < 1e-6, 1e-6, cos_lat)
+        div_h = (du_dlon + dv_cos_dlat) / (R * cos_safe[np.newaxis, :, np.newaxis])
+
+        # Integrate downward from the top (sigma=0) using the midpoint rule
+        sigma = self.z                   # (n_layer,) increasing 0→1
+        d_sigma = np.gradient(sigma)     # layer widths in sigma
+
+        sigma_dot = np.zeros_like(div_h)
+        cumsum = np.zeros(div_h.shape[1:])
+        for k in range(len(sigma)):
+            sigma_dot[k] = -(cumsum + 0.5 * div_h[k] * d_sigma[k])
+            cumsum = cumsum + div_h[k] * d_sigma[k]
+
+        # Negate so that positive w = upward (decreasing sigma), matching ocean convention
+        return -sigma_dot
 
     def _print_shapes(self):
         print(f'sim_type: {self.sim_type}')

@@ -20,7 +20,7 @@ end
 
 const directory = "/home/pt426/data/exo_ocean_sims"
 
-@inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, instellation, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_stress=nothing, initial_T=1.0, albedo=0.06)
+@inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, instellation, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_field=nothing, initial_T=1.0, albedo=0.06)
 
     @info "Setting up simulation..."
 
@@ -74,20 +74,36 @@ const directory = "/home/pt426/data/exo_ocean_sims"
         return -C_Bottom_Drag * v * sqrt(u^2 + v^2)
     end
 
-    # u_top_bc = FluxBoundaryCondition(wind_stress_u, discrete_form=true)
-    # v_top_bc = FluxBoundaryCondition(wind_stress_v, discrete_form=true)
-
     u_bottom_bc = FluxBoundaryCondition(bottom_drag_u, discrete_form=true)
     v_bottom_bc = FluxBoundaryCondition(bottom_drag_v, discrete_form=true)
 
-    # Boundary Conditions
-    if !isnothing(wind_stress)
-        error("Wind stress boundary conditions are not yet implemented.")
-        # u_bcs = FieldBoundaryConditions(top = u_top_bc, bottom = u_bottom_bc)
-        # v_bcs = FieldBoundaryConditions(top = v_top_bc, bottom = v_bottom_bc)
+    # Wind Forcing
+    # wind_field(lon, lat, t) returns (u_wind, v_wind) in m/s, the zonal and
+    # meridional wind speed at the ocean surface, converted to a wind stress
+    # via the standard quadratic bulk formula.
+    @inline function wind_stress_u(lon, lat, t, p)
+        u_wind, v_wind = p.wind_field(lon, lat, t)
+        wind_speed = sqrt(u_wind^2 + v_wind^2)
+        return -rho_air * C_D_wind * wind_speed * u_wind / rho_seawater
     end
-    u_bcs = FieldBoundaryConditions(bottom = u_bottom_bc)
-    v_bcs = FieldBoundaryConditions(bottom = v_bottom_bc)
+
+    @inline function wind_stress_v(lon, lat, t, p)
+        u_wind, v_wind = p.wind_field(lon, lat, t)
+        wind_speed = sqrt(u_wind^2 + v_wind^2)
+        return -rho_air * C_D_wind * wind_speed * v_wind / rho_seawater
+    end
+
+    # Boundary Conditions
+    if !isnothing(wind_field)
+        wind_params = (; wind_field)
+        u_top_bc = FluxBoundaryCondition(wind_stress_u, parameters = wind_params)
+        v_top_bc = FluxBoundaryCondition(wind_stress_v, parameters = wind_params)
+        u_bcs = FieldBoundaryConditions(top = u_top_bc, bottom = u_bottom_bc)
+        v_bcs = FieldBoundaryConditions(top = v_top_bc, bottom = v_bottom_bc)
+    else
+        u_bcs = FieldBoundaryConditions(bottom = u_bottom_bc)
+        v_bcs = FieldBoundaryConditions(bottom = v_bottom_bc)
+    end
 
     # Heat Flux
     # Uniform cooling tuned so total absorbed stellar power = total cooling power.

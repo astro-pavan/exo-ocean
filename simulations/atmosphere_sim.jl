@@ -2,8 +2,9 @@ using SpeedyWeather
 using Dates
 
 include("constants.jl")
+include("floored_vertical_diffusion.jl")
 
-const directory = "/home/pt426/data/exo_ocean_sims"
+const directory = "simulations/runs"
 
 const _cuda_available = try
     using CUDA
@@ -63,7 +64,16 @@ function atmosphere_simulation(simulation_name, rotational_period, surface_press
     # SpeedyWeather's built-in default is Minute(40), which scales to 160min at T7.
     # Reduce this if you see NaN warnings — typically needed for no-rotation cases
     # or large day/night temperature contrasts (>80 K) where winds can be very fast.
-    Δt_at_T31=Minute(20))
+    Δt_at_T31=Minute(20),
+    # Bulk Richardson number above which BulkRichardsonDrag/vertical diffusion cut off
+    # mixing (SpeedyWeather default: 10). See floored_vertical_diffusion.jl for why this
+    # alone doesn't fix weak-wind boundary layer decoupling — min_wind_speed does.
+    critical_Richardson=10.0,
+    # Minimum wind speed [m/s] floored into the bulk Richardson number and mixing
+    # coefficient in FlooredBulkRichardsonDiffusion (floored_vertical_diffusion.jl),
+    # to prevent the surface layer decoupling from the free troposphere under calm
+    # conditions. Comparable to CESM's 0.5 m/s floor.
+    min_wind_speed=1.0)
 
     @info "Setting up atmosphere simulation..."
 
@@ -100,11 +110,24 @@ function atmosphere_simulation(simulation_name, rotational_period, surface_press
     # Newtonian cooling toward day/night equilibrium
     forcing = NewtonianCooling{Float32}(Float32(T_day), Float32(T_night), Float32(τ_rad))
 
+    # Boundary layer drag and vertical diffusion share the same critical_Richardson cutoff;
+    # override both consistently rather than leaving one at the SpeedyWeather default.
+    # Note: BulkRichardsonDrag(spectral_grid; kwargs...) can't forward keyword overrides in
+    # this SpeedyWeather version (its SpectralGrid constructor is missing a `;` before
+    # `kwargs...`, so keywords land as unsupported positional args) — construct via the
+    # type's own keyword constructor instead.
+    boundary_layer = BoundaryLayer(spectral_grid;
+                                   drag=BulkRichardsonDrag{Float32}(critical_Richardson=Float32(critical_Richardson)))
+    vertical_diffusion = FlooredBulkRichardsonDiffusion(spectral_grid;
+                                                        critical_Richardson=Float32(critical_Richardson),
+                                                        min_wind_speed=Float32(min_wind_speed))
+
     # Time-based output (SpeedyWeather uses wall-clock periods, not iteration counts)
     output = NetCDFOutput(spectral_grid, PrimitiveDryModel,
                           path=joinpath(directory, "atm"),
                           id=simulation_name,
                           interval=Hour(output_dt))
+    add!(output, FlooredBoundaryLayerHeightOutput())
 
     time_stepping = Leapfrog(spectral_grid, Δt_at_T31=Δt_at_T31)
     actual_Δt = time_stepping.Δt_millisec.value / 60000
@@ -122,6 +145,8 @@ function atmosphere_simulation(simulation_name, rotational_period, surface_press
                               initial_conditions=StartFromRest(spectral_grid),
                               orography=NoOrography(spectral_grid),
                               land_sea_mask=AquaPlanetMask(spectral_grid),
+                              boundary_layer=boundary_layer,
+                              vertical_diffusion=vertical_diffusion,
                               longwave_radiation=nothing,
                               shortwave_radiation=nothing,
                               # verbose=true forces the progress bar on even when running

@@ -28,14 +28,37 @@ def _is_atmosphere(ds):
     return 'temp' in ds and 'layer' in ds.dims
 
 
+def _select_time(da, time_sel):
+    """Select a single snapshot (int index) or average over a range (slice)."""
+    if isinstance(time_sel, (int, np.integer)):
+        return da.isel(time=time_sel)
+    return da.isel(time=time_sel).mean(dim='time')
+
+
 class SimulationData:
-    def __init__(self, filename, lat_bin=False):
+    def __init__(self, filename, lat_bin=False, time=slice(-10, None)):
+        """
+        filename: path to the NetCDF output file.
+        time: which timestep(s) to load. Either an int (a single snapshot,
+              e.g. -1 for the last one, 0 for the first) or a slice
+              (a range of snapshots that will be averaged, e.g. slice(-10, None)).
+        """
         try:
             ds = xr.open_dataset(filename, decode_times=False)
         except FileNotFoundError:
             raise FileNotFoundError(f"Could not find '{filename}'.")
 
-        print(f"t_final = {np.array(ds['time'])[-1] / (3600 * 24 * 365.25)} yrs")
+        times = np.array(ds['time'])
+        print(f"t_final = {times[-1] / (3600 * 24 * 365.25)} yrs")
+        if isinstance(time, (int, np.integer)):
+            t_sel = times[time]
+            print(f"Loading snapshot at index {time} (t = {t_sel / (3600 * 24 * 365.25):.4f} yrs)")
+        else:
+            t_sel = times[time]
+            print(f"Averaging {len(t_sel)} snapshots from t = {t_sel[0] / (3600 * 24 * 365.25):.4f} "
+                  f"to {t_sel[-1] / (3600 * 24 * 365.25):.4f} yrs")
+
+        self.time_sel = time
 
         if _is_atmosphere(ds):
             self._load_atmosphere(ds, lat_bin)
@@ -45,8 +68,8 @@ class SimulationData:
     def _load_ocean(self, ds, lat_bin):
         self.sim_type = 'ocean'
 
-        T_raw = ds['T'].isel(time=slice(-10, None)).mean(dim='time').squeeze()
-        u_raw = ds['u'].isel(time=slice(-10, None)).mean(dim='time').squeeze()
+        T_raw = _select_time(ds['T'], self.time_sel).squeeze()
+        u_raw = _select_time(ds['u'], self.time_sel).squeeze()
 
         lon = ds[T_raw.dims[-1]]
         lat = ds[T_raw.dims[-2]]
@@ -57,8 +80,8 @@ class SimulationData:
         if 'v' not in ds or 'w' not in ds:
             raise ValueError("Ocean output is missing 'v' or 'w'.")
 
-        v_raw = ds['v'].isel(time=slice(-10, None)).mean(dim='time').squeeze()
-        w_raw = ds['w'].isel(time=slice(-10, None)).mean(dim='time').squeeze()
+        v_raw = _select_time(ds['v'], self.time_sel).squeeze()
+        w_raw = _select_time(ds['w'], self.time_sel).squeeze()
 
         # Interpolate v from y-faces to y-centers if needed
         if v_raw.shape[1] > lat.shape[0]:
@@ -100,9 +123,9 @@ class SimulationData:
     def _load_atmosphere(self, ds, lat_bin):
         self.sim_type = 'atmosphere'
 
-        T_raw = ds['temp'].isel(time=slice(-10, None)).mean(dim='time').squeeze()
-        u_raw = ds['u'].isel(time=slice(-10, None)).mean(dim='time').squeeze()
-        v_raw = ds['v'].isel(time=slice(-10, None)).mean(dim='time').squeeze()
+        T_raw = _select_time(ds['temp'], self.time_sel).squeeze()
+        u_raw = _select_time(ds['u'], self.time_sel).squeeze()
+        v_raw = _select_time(ds['v'], self.time_sel).squeeze()
 
         # SpeedyWeather outputs on a regular lat/lon grid — no face interpolation needed
         self.lon  = np.array(ds['lon'])
@@ -111,8 +134,8 @@ class SimulationData:
         self.u    = np.array(u_raw)
         self.v    = np.array(v_raw)
         self.T    = np.array(T_raw)
-        self.mslp = np.array(ds['mslp'].isel(time=slice(-10, None)).mean(dim='time').squeeze()) if 'mslp' in ds else None
-        self.vor  = np.array(ds['vor'].isel(time=slice(-10, None)).mean(dim='time').squeeze())  if 'vor'  in ds else None
+        self.mslp = np.array(_select_time(ds['mslp'], self.time_sel).squeeze()) if 'mslp' in ds else None
+        self.vor  = np.array(_select_time(ds['vor'], self.time_sel).squeeze())  if 'vor'  in ds else None
 
         # Derive vertical velocity in sigma coordinates from horizontal divergence
         self.w = self._compute_sigma_dot()

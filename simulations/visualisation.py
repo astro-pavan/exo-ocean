@@ -8,7 +8,7 @@ from bokeh.models import (
 )
 from bokeh.layouts import gridplot, column, row
 from bokeh.io import curdoc
-from bokeh.palettes import Magma256, PiYG11
+from bokeh.palettes import Magma256, PiYG11, Turbo256
 
 
 def _expand_palette(hex_colors, n):
@@ -40,8 +40,8 @@ class InteractivePlot:
         "Vertical Velocity (w)", "Vorticity (vor)",
     }
 
-    def __init__(self, sim_path):
-        sim = simulation_reader.SimulationData(sim_path)
+    def __init__(self, sim_path, time=slice(-10, None)):
+        sim = simulation_reader.SimulationData(sim_path, time=time)
         self.lon, self.lat, self.z = sim.lon, sim.lat, sim.z
         self.u, self.v, self.w, self.T = sim.u, sim.v, sim.w, sim.T
         self.sim = sim
@@ -160,7 +160,12 @@ class InteractivePlot:
     def _build_bg_limits(self):
         self.bg_limits = {}
         for name, arr in self.bg_options.items():
-            if name == "Temperature (T)":
+            if name == "Temperature (T)" and self.is_atmosphere:
+                # Fixed colorscale across the whole simulation (all z-levels)
+                # rather than per-level, so colors stay comparable as the
+                # z-slider moves and across the full 3D pressure profile.
+                self.bg_limits[name] = (np.nanmin(arr), np.nanmax(arr))
+            elif name == "Temperature (T)":
                 self.bg_limits[name] = [
                     (np.nanmin(arr[k]), np.nanmax(arr[k])) for k in range(len(self.z))
                 ]
@@ -173,9 +178,16 @@ class InteractivePlot:
 
     def _get_color_limits(self, bg_name, z_idx):
         lims = self.bg_limits[bg_name]
-        if bg_name == "Temperature (T)":
+        if bg_name == "Temperature (T)" and not self.is_atmosphere:
             return lims[z_idx]
         return lims
+
+    def _palette_for(self, bg_name):
+        """Rainbow palette for atmosphere temperature so nearby values are
+        visually distinguishable; Magma elsewhere for linear-scale fields."""
+        if bg_name == "Temperature (T)" and self.is_atmosphere:
+            return Turbo256
+        return Magma256
 
     def _get_xy_slice(self, z_idx, bg_array):
         u_sub = self.u[z_idx, ::self.skip_xy, ::self.skip_xy].flatten()
@@ -228,7 +240,7 @@ class InteractivePlot:
         init_bg_name = "Temperature (T)"
         init_z_idx   = len(self.z) - 1
         lo, hi = self._get_color_limits(init_bg_name, init_z_idx)
-        self.color_mapper = LinearColorMapper(palette=Magma256, low=lo, high=hi)
+        self.color_mapper = LinearColorMapper(palette=self._palette_for(init_bg_name), low=lo, high=hi)
 
         bg = self.bg_options[init_bg_name]
         vec_xy, img_xy = self._get_xy_slice(init_z_idx, bg)
@@ -334,7 +346,7 @@ class InteractivePlot:
             self.color_mapper.low, self.color_mapper.high = self._get_color_limits(bg_name, z_idx)
 
             if bg_name in ("Temperature (T)", "Mean SL Pressure"):
-                self.color_mapper.palette = Magma256
+                self.color_mapper.palette = self._palette_for(bg_name)
                 self.color_bar.ticker = self.linear_ticker
                 self.color_bar.formatter = self.linear_formatter
             else:
@@ -378,7 +390,7 @@ class InteractivePlot:
         )
 
 
-interactive_plot = InteractivePlot('exo_ocean_sims/atm/run_atm_coriolis_4_0001/output.nc')
+interactive_plot = InteractivePlot('simulations/runs/atm/run_atm_boundary_test_0025/output.nc')
 
 curdoc().add_root(interactive_plot.get_layout())
 curdoc().title = "3D Quiver Plots"

@@ -18,7 +18,7 @@ catch
     false
 end
 
-const directory = "/home/pt426/data/exo_ocean_sims"
+const directory = "simulations/runs"
 
 @inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, instellation, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_field=nothing, initial_T=1.0, albedo=0.06)
 

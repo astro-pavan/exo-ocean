@@ -33,7 +33,8 @@ from simulation_reader import SimulationData
 
 ROT_PERIOD = [3, 5, 10, 30, 50]                 # days
 CONTRAST_DT = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0]  # degC
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "exo_ocean_sims", "ocean")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "output", "ocean")
+FIG_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
 
 TIME_SEL = slice(-3, None)   # average last few snapshots
 SPEED_BAND = 2.5             # deg; equatorial jet speed = peak u within this band

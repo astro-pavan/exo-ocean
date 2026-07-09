@@ -443,7 +443,7 @@ class InteractivePlot:
         )
 
 
-interactive_plot = InteractivePlot('exo_ocean_sims/ocean/coriolis_P_10_dT_0.1_D_1.nc')
+interactive_plot = InteractivePlot('output/ocean/coriolis_P_10_dT_0.1_D_1.nc')
 
 curdoc().add_root(interactive_plot.get_layout())
 curdoc().title = "3D Quiver Plots"

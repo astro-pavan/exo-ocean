@@ -1,4 +1,4 @@
-include("ocean_sim.jl")
+include("../src/ocean_sim.jl")
 using Oceananigans.Units
 
 T_day_default = 30

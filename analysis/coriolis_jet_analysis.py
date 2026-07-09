@@ -208,7 +208,7 @@ def main():
     fig.suptitle("Equatorial jet: Coriolis sweep (spun-up runs only)", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
 
-    out = os.path.join(os.path.dirname(__file__), "coriolis_jet_sweep.png")
+    out = os.path.join(os.path.dirname(__file__), "..", "figures", "coriolis_jet_sweep.png")
     fig.savefig(out, dpi=150)
     print(f"\nSaved sweep plot to {out}")
 

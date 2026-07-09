@@ -1,8 +1,8 @@
-include("ocean_sim.jl")
+include("../src/ocean_sim.jl")
 using Oceananigans.Units
 
 T_night_default = 0
-delta_T = [0.1, 0.3, 1, 3, 10, 30]
+delta_T = [10] # [0.1, 0.3, 1, 3, 5, 10, 30, 50]
 rotation_period = [3, 5, 10, 30, 50]
 depth = 1 # km
 

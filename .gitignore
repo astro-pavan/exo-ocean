@@ -1,4 +1,4 @@
-exo_ocean_sims
+output
 *.png
 .claude
 
@@ -220,3 +220,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# keep the (otherwise empty, png-only) figures dir tracked
+!figures/.gitkeep

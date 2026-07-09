@@ -4,7 +4,7 @@ using Dates
 include("constants.jl")
 include("floored_vertical_diffusion.jl")
 
-const directory = "exo_ocean_sims/"
+const directory = "output/"
 
 const _cuda_available = try
     using CUDA

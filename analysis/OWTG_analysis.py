@@ -151,7 +151,7 @@ def loglog_powerlaw(x, y, xlabel, title, out_name, symbol):
     ax.legend()
     fig.tight_layout()
 
-    out = os.path.join(os.path.dirname(__file__), out_name)
+    out = os.path.join(os.path.dirname(__file__), "..", "figures", out_name)
     fig.savefig(out, dpi=150)
     print(f"Saved plot to {out}")
 
@@ -198,7 +198,7 @@ def contrast_sweep_plot():
     ax.legend(fontsize=8)
     fig.tight_layout()
 
-    out = os.path.join(os.path.dirname(__file__), "OWTG_contrast_vs_velocity.png")
+    out = os.path.join(os.path.dirname(__file__), "..", "figures", "OWTG_contrast_vs_velocity.png")
     fig.savefig(out, dpi=150)
     print(f"\nSaved plot to {out}")
 

@@ -1,4 +1,4 @@
-include("atmosphere_sim.jl")
+include("../src/atmosphere_sim.jl")
 
 const days = 86400  # seconds
 

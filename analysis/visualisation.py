@@ -1,4 +1,4 @@
-import simulation_analysis.simulation_reader as simulation_reader
+import simulation_reader
 
 import numpy as np
 from bokeh.plotting import figure
@@ -443,7 +443,7 @@ class InteractivePlot:
         )
 
 
-interactive_plot = InteractivePlot('exo_ocean_sims/ocean/coriolis_P_30_dT_10.0_D_1.nc')
+interactive_plot = InteractivePlot('exo_ocean_sims/ocean/coriolis_P_10_dT_0.1_D_1.nc')
 
 curdoc().add_root(interactive_plot.get_layout())
 curdoc().title = "3D Quiver Plots"

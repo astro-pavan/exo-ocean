@@ -1,4 +1,4 @@
-import simulation_reader
+import simulation_analysis.simulation_reader as simulation_reader
 
 import numpy as np
 from bokeh.plotting import figure

@@ -297,7 +297,7 @@ const directory = "exo_ocean_sims/"
     # The wizard only tracks *advective* CFL, but the biharmonic viscosity has its own diffusive stability limit (~τ_biharmonic/32 for the near-isotropic equatorial cells).
     # During quiescent spin-up (near-zero velocity) the advective CFL is tiny, so cap Δt below that biharmonic limit to stop Δt growing into an instability.
     max_Δt = min(1days, τ_biharmonic / 64)
-    wizard = TimeStepWizard(cfl=0.2, max_change=1.05, max_Δt=max_Δt)
+    wizard = TimeStepWizard(cfl=0.1, max_change=1.05, max_Δt=max_Δt)
     simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
     @info "Simulation setup complete. Starting the run..."

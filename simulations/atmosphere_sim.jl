@@ -4,7 +4,7 @@ using Dates
 include("constants.jl")
 include("floored_vertical_diffusion.jl")
 
-const directory = "simulations/runs"
+const directory = "exo_ocean_sims/"
 
 const _cuda_available = try
     using CUDA
@@ -38,6 +38,7 @@ function SpeedyWeather.forcing!(vars::SpeedyWeather.Variables,
     latds  = model.geometry.latds
     σ_full = model.geometry.σ_levels_full
     κ      = Float32(model.atmosphere.κ)   # R_dry / c_p ≈ 0.286
+    radius = Float32(model.planet.radius)
 
     temp_grid = vars.grid.temperature
     dTdt      = vars.tendencies.grid.temperature
@@ -53,7 +54,12 @@ function SpeedyWeather.forcing!(vars::SpeedyWeather.Variables,
             # This puts the stellar heating at the surface and keeps the stratosphere cold,
             # so the upper atmosphere does not fight the surface contrast.
             T_eq = max(200f0, T_eq_surf * σ^κ)
-            dTdt[ij, k] -= (temp_grid[ij, k] - T_eq) / F.τ_rad
+            # SpeedyWeather's grid-space forcing tendency must be scaled by the planet
+            # radius to match the internal non-dimensionalisation of the temperature
+            # equation (confirmed against the built-in HeldSuarez forcing, which does
+            # the same: `temp_relax_freq .*= radius`). Without this the relaxation is
+            # effectively radius-times too weak and the day/night contrast never forms.
+            dTdt[ij, k] -= radius * (temp_grid[ij, k] - T_eq) / F.τ_rad
         end
     end
 end

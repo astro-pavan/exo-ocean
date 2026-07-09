@@ -24,6 +24,51 @@ def rebin(arr, factors):
     return reshaped_arr.mean(axis=reduce_axes)
 
 
+def _shapiro_1d(f, axis, order, periodic):
+    """One Shapiro pass of half-order `order` along a single axis (see shapiro_filter)."""
+    mode = 'wrap' if periodic else 'edge'
+    pad_width = [(1, 1) if i == axis else (0, 0) for i in range(f.ndim)]
+    lo = tuple(slice(0, -2) if i == axis else slice(None) for i in range(f.ndim))
+    hi = tuple(slice(2, None) if i == axis else slice(None) for i in range(f.ndim))
+
+    def second_diff_over_4(x):
+        xp = np.pad(x, pad_width, mode=mode)
+        return (xp[hi] - 2.0 * x + xp[lo]) / 4.0
+
+    # S = δ²/4 has Fourier response -sin²(kΔ/2); applying it `order` times and forming
+    # f - (-1)**order · Sᵒʳᵈᵉʳ f gives response (1 - sin(kΔ/2)**(2·order)): the 2Δ mode
+    # (kΔ = π) is removed exactly, and larger `order` leaves resolved scales less damped.
+    Sp = f
+    for _ in range(order):
+        Sp = second_diff_over_4(Sp)
+    return f - ((-1) ** order) * Sp
+
+
+def shapiro_filter(arr, order=2, passes=1, axes=(-2, -1), periodic=(-1,)):
+    """
+    Shapiro filter: removes 2-grid-length (2Δ) noise while preserving the resolved
+    scales, without coarsening the grid (unlike `rebin`).
+
+    The filter response is R(k) = 1 - sin(kΔ/2)**(2*order): it zeroes the 2Δ checkerboard
+    mode exactly, and higher `order` gives a sharper cutoff that leaves well-resolved
+    scales progressively less damped. `order=1` is the classic 1-2-1 filter.
+
+    arr      : array to filter, e.g. an ocean field with dims (z, lat, lon).
+    order    : half-order of the filter (>=1); response ~ 1 - sin**(2*order).
+    passes   : number of times to apply the whole filter (stronger smoothing).
+    axes     : axes to filter along; default = the last two (lat, lon).
+    periodic : axes treated as periodic (wrap); the rest use replicate (edge)
+               boundaries. Default: the last axis (longitude) is periodic.
+    """
+    out = np.array(arr, dtype=float)
+    axes = [a % out.ndim for a in axes]
+    periodic = {a % out.ndim for a in periodic}
+    for _ in range(passes):
+        for ax in axes:
+            out = _shapiro_1d(out, ax, order, ax in periodic)
+    return out
+
+
 def _is_atmosphere(ds):
     return 'temp' in ds and 'layer' in ds.dims
 
@@ -36,7 +81,7 @@ def _select_time(da, time_sel):
 
 
 class SimulationData:
-    def __init__(self, filename, lat_bin=False, time=slice(-10, None)):
+    def __init__(self, filename, lat_bin=False, time=slice(-1, None)):
         """
         filename: path to the NetCDF output file.
         time: which timestep(s) to load. Either an int (a single snapshot,
@@ -48,8 +93,11 @@ class SimulationData:
         except FileNotFoundError:
             raise FileNotFoundError(f"Could not find '{filename}'.")
 
-        times = np.array(ds['time'])
-        print(f"t_final = {times[-1] / (3600 * 24 * 365.25)} yrs")
+        time_units = ds['time'].attrs.get('units', 'seconds')
+        seconds_per_unit = 3600 if time_units.startswith('hours') else 1
+        times = np.array(ds['time']) * seconds_per_unit
+        print(f"t_final = {times[-1] / (3600 * 24)} days")
+
         if isinstance(time, (int, np.integer)):
             t_sel = times[time]
             print(f"Loading snapshot at index {time} (t = {t_sel / (3600 * 24 * 365.25):.4f} yrs)")

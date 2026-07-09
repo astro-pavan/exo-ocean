@@ -4,7 +4,7 @@ import numpy as np
 from bokeh.plotting import figure
 from bokeh.models import (
     ColumnDataSource, Slider, Span, LinearColorMapper, ColorBar, Select,
-    CustomJSTickFormatter, BasicTickFormatter, BasicTicker, FixedTicker,
+    BasicTickFormatter, FixedTicker,
 )
 from bokeh.layouts import gridplot, column, row
 from bokeh.io import curdoc
@@ -37,19 +37,33 @@ class InteractivePlot:
     # values. Temperature/pressure stay linear since they aren't sign-symmetric.
     DIVERGING_FIELDS = {
         "Zonal Velocity (u)", "Meridional Velocity (v)",
-        "Vertical Velocity (w)", "Vorticity (vor)",
+        "Vertical Velocity (w)", "Vorticity (vor)", "Radial Velocity (v_r)",
     }
 
-    def __init__(self, sim_path, time=slice(-10, None)):
+    # Both sim setups (ocean_sim.jl, atmosphere_sim.jl) place the substellar
+    # point at lon=0, lat=0 (insolation ~ cos(lon)*cos(lat)); radial velocity
+    # is defined relative to that point.
+    SUBSTELLAR_LON, SUBSTELLAR_LAT = 0.0, 0.0
+
+    def __init__(self, sim_path, time=slice(-10, None), w_shapiro_passes=1):
         sim = simulation_reader.SimulationData(sim_path, time=time)
         self.lon, self.lat, self.z = sim.lon, sim.lat, sim.z
-        self.u, self.v, self.w, self.T = sim.u, sim.v, sim.w, sim.T
+        self.u, self.v, self.T = sim.u, sim.v, sim.T
+        # The diagnostic vertical velocity carries grid-scale (2Δ) checkerboard noise
+        # from the horizontal-divergence operator, strongest at the equatorial/substellar
+        # convergence zones (u, v, T stay clean). Filter only w, and only for display —
+        # sim.w is left untouched for any quantitative use. The Shapiro filter removes the
+        # 2Δ mode while keeping full resolution, unlike rebin. Set w_shapiro_passes=0 to disable.
+        if sim.w is not None and w_shapiro_passes > 0:
+            self.w = simulation_reader.shapiro_filter(sim.w, order=2, passes=w_shapiro_passes)
+        else:
+            self.w = sim.w
         self.sim = sim
 
         self.is_atmosphere = sim.sim_type == 'atmosphere'
         self.z_label = "Pressure Level (σ)" if self.is_atmosphere else "Depth (m)"
 
-        self.skip_xy = 1
+        self.skip_xy = max(len(sim.lon) // 90, 1)
         self.skip_z = 1
 
         self._build_grids()
@@ -118,27 +132,59 @@ class InteractivePlot:
         exponent = int(np.floor(np.log10(abs(v))))
         return f"{v:g}" if -3 <= exponent <= 3 else f"{v:.0e}"
 
-    def _symlog_ticker_formatter(self, max_abs, linthresh):
-        """Build a (ticker, formatter) pair placing ticks at nice round physical
-        values, positioned via the forward symlog transform. This makes the
-        log-scaled nature of the color bar visible (ticks bunch up away from
-        zero) rather than showing evenly-spaced positions with odd values."""
+    def _symlog_ticks_overrides(self, max_abs, linthresh):
+        """Build a (tick_positions, label_overrides) pair placing ticks at nice
+        round physical values, positioned via the forward symlog transform. This
+        makes the log-scaled nature of the color bar visible (ticks bunch up away
+        from zero) while the labels report the true physical values.
+
+        The positions are fed into the one persistent FixedTicker (see
+        _update_plots) and the labels via major_label_overrides (a pure-Python
+        position→label map). Both the CustomJSTickFormatter path and swapping in
+        a fresh ticker object failed to re-render on an already-drawn ColorBar
+        over the Bokeh server — the bar kept its original auto ticker and showed
+        the raw transformed axis positions (plain integers). Mutating the
+        existing ticker's .ticks in place rebinds reliably."""
         values = self._decade_tick_values(max_abs, linthresh)
         positions = [float(np.sign(v) * np.log1p(abs(v) / linthresh)) for v in values]
-        labels = [self._format_tick_value(v) for v in values]
-        ticker = FixedTicker(ticks=positions)
-        formatter = CustomJSTickFormatter(
-            args=dict(positions=positions, labels=labels),
-            code="""
-                let best = 0, best_dist = Infinity;
-                for (let i = 0; i < positions.length; i++) {
-                    const d = Math.abs(positions[i] - tick);
-                    if (d < best_dist) { best_dist = d; best = i; }
-                }
-                return labels[best];
-            """,
-        )
-        return ticker, formatter
+        overrides = {pos: self._format_tick_value(v) for pos, v in zip(positions, values)}
+        return positions, overrides
+
+    @staticmethod
+    def _linear_ticks(lo, hi, n=7):
+        """Nice round evenly-spaced tick positions spanning [lo, hi], for the
+        linear (temperature / pressure) color bar. Fed into the same persistent
+        FixedTicker; the default BasicTickFormatter renders them as-is since
+        these fields aren't transformed."""
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return [float(lo)] if np.isfinite(lo) else [0.0]
+        raw_step = (hi - lo) / (n - 1)
+        mag = 10.0 ** np.floor(np.log10(raw_step))
+        step = next(m * mag for m in (1, 2, 2.5, 5, 10) if raw_step <= m * mag)
+        start = np.ceil(lo / step) * step
+        return [float(t) for t in np.arange(start, hi + step * 0.5, step)]
+
+    def _compute_radial_velocity(self):
+        """Component of the horizontal velocity pointing directly away from
+        the substellar point: (u, v) projected onto the exact unit vector,
+        tangent to the sphere, along the great circle away from
+        (SUBSTELLAR_LON, SUBSTELLAR_LAT). Positive = outflow, negative = inflow.
+        """
+        lon0 = np.radians(self.SUBSTELLAR_LON)
+        lat0 = np.radians(self.SUBSTELLAR_LAT)
+        lon = np.radians(self.lon)[np.newaxis, :]
+        lat = np.radians(self.lat)[:, np.newaxis]
+        dlon = lon - lon0
+
+        cos_rho = np.sin(lat0) * np.sin(lat) + np.cos(lat0) * np.cos(lat) * np.cos(dlon)
+        sin_rho = np.sqrt(np.clip(1 - cos_rho ** 2, 0, None))
+        # Undefined exactly at the substellar/antistellar point (no preferred direction)
+        sin_rho = np.where(sin_rho < 1e-9, np.nan, sin_rho)
+
+        e_east  = np.cos(lat0) * np.sin(dlon) / sin_rho
+        e_north = (np.sin(lat) * np.cos(lat0) * np.cos(dlon) - np.sin(lat0) * np.cos(lat)) / sin_rho
+
+        return self.u * e_east + self.v * e_north
 
     def _build_bg_options(self):
         self.bg_linthresh = {}
@@ -150,6 +196,9 @@ class InteractivePlot:
         }
         if self.w is not None:
             self.bg_options["Vertical Velocity (w)"] = self._symlog("Vertical Velocity (w)", self.w)
+        self.bg_options["Radial Velocity (v_r)"] = self._symlog(
+            "Radial Velocity (v_r)", self._compute_radial_velocity()
+        )
         if self.sim.mslp is not None:
             self.bg_options["Mean SL Pressure"] = np.tile(
                 self.sim.mslp[np.newaxis, :, :], (len(self.z), 1, 1)
@@ -270,10 +319,13 @@ class InteractivePlot:
                           source=self.source_xy_vec, color="black", line_width=1.0)
         self.p_xy.scatter(x='x1', y='y1', source=self.source_xy_vec, marker="triangle",
                           angle='angle', size=6, color="black", alpha=0.5)
-        self.linear_ticker = BasicTicker()
-        self.linear_formatter = BasicTickFormatter()
+        # One persistent ticker whose .ticks we mutate in place on every field
+        # switch. Replacing the ticker object (or using a CustomJSTickFormatter)
+        # did not re-render on the live ColorBar; mutating this model's props does.
+        init_lo, init_hi = self._get_color_limits("Temperature (T)", len(self.z) - 1)
+        self.cbar_ticker = FixedTicker(ticks=self._linear_ticks(init_lo, init_hi))
         self.color_bar = ColorBar(color_mapper=cm, title="Temp", location=(0, 0),
-                                   ticker=self.linear_ticker, formatter=self.linear_formatter)
+                                   ticker=self.cbar_ticker, formatter=BasicTickFormatter())
         self.p_xy.add_layout(self.color_bar, 'left')
 
         self.p_xz = figure(
@@ -343,19 +395,20 @@ class InteractivePlot:
             bg_name  = self.select_bg.value
             bg_array = self.bg_options[bg_name]
 
-            self.color_mapper.low, self.color_mapper.high = self._get_color_limits(bg_name, z_idx)
+            lo, hi = self._get_color_limits(bg_name, z_idx)
+            self.color_mapper.low, self.color_mapper.high = lo, hi
 
             if bg_name in ("Temperature (T)", "Mean SL Pressure"):
                 self.color_mapper.palette = self._palette_for(bg_name)
-                self.color_bar.ticker = self.linear_ticker
-                self.color_bar.formatter = self.linear_formatter
+                self.cbar_ticker.ticks = self._linear_ticks(lo, hi)
+                self.color_bar.major_label_overrides = {}
             else:
                 self.color_mapper.palette = VELOCITY_PALETTE
-                ticker, formatter = self._symlog_ticker_formatter(
+                positions, overrides = self._symlog_ticks_overrides(
                     self.bg_max_abs[bg_name], self.bg_linthresh[bg_name]
                 )
-                self.color_bar.ticker = ticker
-                self.color_bar.formatter = formatter
+                self.cbar_ticker.ticks = positions
+                self.color_bar.major_label_overrides = overrides
             self.color_bar.title = bg_name.split(" ")[0]
 
             vec_xy, img_xy = self._get_xy_slice(z_idx, bg_array)
@@ -390,7 +443,7 @@ class InteractivePlot:
         )
 
 
-interactive_plot = InteractivePlot('simulations/runs/atm/run_atm_boundary_test_0025/output.nc')
+interactive_plot = InteractivePlot('exo_ocean_sims/ocean/coriolis_P_30_dT_10.0_D_1.nc')
 
 curdoc().add_root(interactive_plot.get_layout())
 curdoc().title = "3D Quiver Plots"

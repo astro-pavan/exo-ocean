@@ -1,4 +1,6 @@
-simulations/runs/
+exo_ocean_sims
+*.png
+.claude
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

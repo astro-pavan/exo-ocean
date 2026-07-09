@@ -21,7 +21,7 @@ end
 
 const directory = "output/"
 
-@inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_field=nothing, initial_T=nothing, τ_relax=30days, τ_biharmonic=10days, κ_horizontal=1e3, pickup=nothing, checkpoint_interval=nothing, instellation=nothing, albedo=0.06)
+@inline function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time; n_lat=160, n_lon=360, n_depth=20, use_GPU=true, n_write=1000, wind_field=nothing, initial_T=nothing, τ_relax=30days, τ_biharmonic=10days, κ_horizontal=1e3, pickup=nothing, checkpoint_interval=nothing, convergence_tol=0.05, convergence_cv=0.1, convergence_window=180days, min_convergence_time=180days, instellation=nothing, albedo=0.06)
 
     @info "Setting up simulation..."
 
@@ -230,6 +230,9 @@ const directory = "output/"
     # (robust to the adaptive timestep). NaN sentinels skip the rate on the first call.
     prev_diag = Ref((t = 0.0, T = NaN, KE = NaN))
 
+    # Rolling (time, ⟨KE⟩) history for the early-stop convergence test below.
+    ke_history = Ref(Vector{Tuple{Float64,Float64}}())
+
     @inline function display_progress(sim)
         u_data = interior(sim.model.velocities.u)
 
@@ -263,6 +266,41 @@ const directory = "output/"
             "(d⟨T⟩/dt: $(round(dT_dt, digits=3)) °C/yr), " *
             "⟨KE⟩: $(round(mean_KE, sigdigits=3)) m²/s² " *
             "(d⟨KE⟩/dt: $(round(dKE_dt, digits=2)) %/day)"
+
+        # Early-stop when the circulation has spun up: the volume-averaged kinetic
+        # energy stops evolving. A single-sample rate is far too noisy (⟨KE⟩
+        # fluctuates by tens of % between samples during spin-up), so we fit a
+        # least-squares trend to all ⟨KE⟩ samples in a trailing `convergence_window`
+        # and require BOTH:
+        #   • trend  — fractional slope |d⟨KE⟩/dt| / ⟨KE⟩ < `convergence_tol` (%/day)
+        #   • steadiness — scatter about that trend, std(residual)/⟨KE⟩ < `convergence_cv`
+        # The second condition is essential: a fluctuating spin-up (e.g. weak-forcing
+        # runs) can show near-zero *net* slope over a window while still swinging by
+        # tens of % — the trend test alone would false-trigger there, but its large
+        # scatter keeps it running. `min_convergence_time` guards the initial spin-up.
+        # Set `convergence_tol = nothing` to disable early stopping entirely.
+        if !isnothing(convergence_tol) && isfinite(mean_KE) && mean_KE > 0
+            push!(ke_history[], (t, mean_KE))
+            filter!(s -> t - s[1] <= convergence_window, ke_history[])  # keep trailing window
+            hist = ke_history[]
+            if t >= min_convergence_time && length(hist) >= 3 &&
+               (hist[end][1] - hist[1][1]) >= convergence_window
+                ts  = [s[1] / 86400 for s in hist]      # days
+                kes = [s[2]        for s in hist]
+                t_mean, ke_mean = mean(ts), mean(kes)
+                slope = sum((ts .- t_mean) .* (kes .- ke_mean)) / sum((ts .- t_mean) .^ 2)  # ⟨KE⟩/day
+                intercept = ke_mean - slope * t_mean
+                drift   = abs(slope) / ke_mean * 100                                # %/day (trend)
+                scatter = std(kes .- (intercept .+ slope .* ts)) / ke_mean          # fluctuation about trend
+                if drift < convergence_tol && scatter < convergence_cv
+                    @info "Converged: ⟨KE⟩ drift $(round(drift, sigdigits=2)) %/day (< $(convergence_tol)), " *
+                          "scatter $(round(scatter*100, sigdigits=2))% (< $(round(convergence_cv*100))%) " *
+                          "over the last $(round(Int, (hist[end][1]-hist[1][1])/86400)) days. " *
+                          "Stopping early at $(prettytime(t)) (of $(prettytime(simulation_time)))."
+                    sim.running = false
+                end
+            end
+        end
     end
 
     simulation.callbacks[:progress] = Callback(display_progress, IterationInterval(100))

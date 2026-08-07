@@ -9,6 +9,6 @@ depth = 1 # km
 
 for P in rotation_period
     for dT in delta_T
-        ocean_simulation("coriolis_P_$(P)_dT_$(dT)_D_$(depth)", P, depth * kilometer, R_Earth, T_night_default + dT, T_night_default, 20*365days, n_lat=160, n_lon=360, n_depth=16, use_GPU=false, checkpoint_interval=356days)
+        ocean_simulation("coriolis_P_$(P)_dT_$(dT)_D_$(depth)", P, depth * kilometer, R_Earth, T_night_default + dT, T_night_default, 1000days, n_lat=160, n_lon=360, n_depth=16, use_GPU=false, checkpoint_interval=356days)
     end
 end

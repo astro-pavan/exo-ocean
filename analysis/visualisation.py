@@ -1,4 +1,7 @@
-import simulation_reader
+import sys
+
+from analysis import simulation_reader
+from analysis.paths import OCEAN_DIR
 
 import numpy as np
 from bokeh.plotting import figure
@@ -443,7 +446,9 @@ class InteractivePlot:
         )
 
 
-interactive_plot = InteractivePlot('output/ocean/coriolis_P_10_dT_0.1_D_1.nc')
-
-curdoc().add_root(interactive_plot.get_layout())
-curdoc().title = "3D Quiver Plots"
+# Bokeh app: bokeh serve --show analysis/visualisation.py --args <output .nc file>  (bokeh names the app module bokeh_app_*)
+if __name__.startswith("bokeh_app_"):
+    sim_file = sys.argv[1] if len(sys.argv) > 1 else str(OCEAN_DIR / "coriolis_P_10_dT_0.1_D_1.nc")
+    interactive_plot = InteractivePlot(sim_file)
+    curdoc().add_root(interactive_plot.get_layout())
+    curdoc().title = "3D Quiver Plots"

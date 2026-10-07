@@ -9,7 +9,7 @@ defined in visualisation.py), and take the spatial average of its magnitude.
 We then plot forcing temperature vs. average radial speed on log-log axes and
 fit a power law v ~ T^n to look for scaling behaviour.
 
-Run with:  /data/pt426/big-venv/bin/python OWTG_analysis.py
+Run with (from any directory, after `pip install -r requirements.txt`):  python analysis/OWTG_analysis.py
 """
 
 import os
@@ -17,7 +17,8 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-from simulation_reader import SimulationData
+from analysis.simulation_reader import SimulationData
+from analysis.paths import OCEAN_DIR, FIG_DIR
 
 # Temperature sweep: day-side equilibrium temperature (deg C) at fixed depth.
 T_DAY = [1, 3, 5, 10, 30, 50]
@@ -41,7 +42,7 @@ CONTRAST_SWEEP_DEPTH_M = 1000.0   # contrast runs are all at 1 km depth
 GRAVITY = 9.81               # m/s^2  (g_Earth)
 THERMAL_EXPANSION = 2e-4     # 1/degC (LinearEquationOfState thermal_expansion)
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "exo_ocean_sims", "ocean")
+DATA_DIR = str(OCEAN_DIR)
 
 # Substellar point (matches ocean_sim.jl forcing and visualisation.py).
 SUBSTELLAR_LON, SUBSTELLAR_LAT = 0.0, 0.0
@@ -151,7 +152,7 @@ def loglog_powerlaw(x, y, xlabel, title, out_name, symbol):
     ax.legend()
     fig.tight_layout()
 
-    out = os.path.join(os.path.dirname(__file__), "..", "figures", out_name)
+    out = os.path.join(FIG_DIR, out_name)
     fig.savefig(out, dpi=150)
     print(f"Saved plot to {out}")
 
@@ -198,7 +199,7 @@ def contrast_sweep_plot():
     ax.legend(fontsize=8)
     fig.tight_layout()
 
-    out = os.path.join(os.path.dirname(__file__), "..", "figures", "OWTG_contrast_vs_velocity.png")
+    out = os.path.join(FIG_DIR, "OWTG_contrast_vs_velocity.png")
     fig.savefig(out, dpi=150)
     print(f"\nSaved plot to {out}")
 

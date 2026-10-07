@@ -20,7 +20,7 @@ width-vs-P panel:
 So L_eq ~ P^{1/2} dT^{1/4}; it is a meridional length scale (half-width-like),
 converted to degrees for comparison with the measured FWHM.
 
-Run with:  /data/pt426/big-venv/bin/python coriolis_jet_analysis.py
+Run with (from any directory, after `pip install -r requirements.txt`):  python analysis/coriolis_jet_analysis.py
 """
 
 import os
@@ -29,12 +29,13 @@ import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
 
-from simulation_reader import SimulationData
+from analysis.simulation_reader import SimulationData
+from analysis.paths import OCEAN_DIR, FIG_DIR as _FIG_DIR
 
 ROT_PERIOD = [3, 5, 10, 30, 50]                          # days
 CONTRAST_DT = [0.1, 0.3, 0.5, 1.0, 3.0, 5.0, 10.0, 30.0, 50.0]  # degC
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "output", "ocean")
-FIG_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
+DATA_DIR = str(OCEAN_DIR)
+FIG_DIR = str(_FIG_DIR)
 
 TIME_SEL = slice(-3, None)   # average last few snapshots
 SPEED_BAND = 2.5             # deg; equatorial jet speed = peak u within this band
@@ -233,7 +234,7 @@ def main():
     fig.suptitle("Equatorial jet: Coriolis sweep (spun-up runs only)", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
 
-    out = os.path.join(os.path.dirname(__file__), "..", "figures", "coriolis_jet_sweep.png")
+    out = os.path.join(FIG_DIR, "coriolis_jet_sweep.png")
     fig.savefig(out, dpi=150)
     print(f"\nSaved sweep plot to {out}")
 
@@ -285,7 +286,7 @@ def gravity_wave_plot(speed, jet_present, P, dT):
     fig.suptitle("Equatorial jet speed vs. gravity-wave speed", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
-    out = os.path.join(os.path.dirname(__file__), "..", "figures", "coriolis_jet_vs_gravitywave.png")
+    out = os.path.join(FIG_DIR, "coriolis_jet_vs_gravitywave.png")
     fig.savefig(out, dpi=150)
     print(f"Saved gravity-wave plot to {out}")
 
@@ -326,7 +327,7 @@ def speed_width_plot(speed, width, width_ok, P, dT):
     ax.legend(fontsize=8)
     fig.tight_layout()
 
-    out = os.path.join(os.path.dirname(__file__), "..", "figures", "coriolis_jet_speed_vs_width.png")
+    out = os.path.join(FIG_DIR, "coriolis_jet_speed_vs_width.png")
     fig.savefig(out, dpi=150)
     print(f"Saved speed-vs-width plot to {out}")
 
@@ -375,7 +376,7 @@ def volume_flux_plot(speed, width, thermo, width_ok, P, dT):
     fig.suptitle("Equatorial jet warm-layer volume flux  $Q = v \\times H_{warm} \\times w$", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
-    out = os.path.join(os.path.dirname(__file__), "..", "figures", "coriolis_jet_volume_flux.png")
+    out = os.path.join(FIG_DIR, "coriolis_jet_volume_flux.png")
     fig.savefig(out, dpi=150)
     print(f"Saved volume-flux plot to {out}")
 

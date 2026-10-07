@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exo-ocean"
+version = "0.1.0"
+description = "Analysis tools for tidally locked exoplanet ocean simulations"
+requires-python = ">=3.11"
+dependencies = ["numpy", "scipy", "matplotlib", "pandas", "xarray", "netCDF4", "bokeh"]  # exact versions pinned in requirements.txt
+
+[project.optional-dependencies]
+climate = ["clero"]  # CLERO emulator for src/climate
+
+[tool.setuptools]
+packages = ["analysis"]

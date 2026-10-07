@@ -1,6 +1,7 @@
 output
 *.png
 .claude
+docs/LLM/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -223,3 +224,7 @@ __marimo__/
 
 # keep the (otherwise empty, png-only) figures dir tracked
 !figures/.gitkeep
+
+# Machine-specific files written by setup.sh
+env.sh
+LocalPreferences.toml

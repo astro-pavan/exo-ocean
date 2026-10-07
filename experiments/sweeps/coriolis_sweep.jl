@@ -1,4 +1,4 @@
-include("../src/ocean_sim.jl")
+include(joinpath(@__DIR__, "..", "..", "src", "ocean", "ocean_sim.jl"))
 using Oceananigans.Units
 
 T_night_default = 0

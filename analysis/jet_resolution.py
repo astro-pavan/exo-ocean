@@ -24,6 +24,7 @@ SCHEMES = ["bih10", "bih100", "weno9", "weno5", "weno9_tr"]
 REFERENCES = ["weno9", "bih10"]   # schemes with a 0.25° run
 EQ_BAND = 5.0                      # jet = zonal-mean u within ±EQ_BAND° of the equator ...
 JET_DEPTH = 100.0                  # ... averaged over the top JET_DEPTH m (Δz-weighted)
+MIN_YEARS = 0.5                    # runs with less valid output than this are skipped
 
 
 def run_name(scheme, res):
@@ -74,6 +75,10 @@ def analyse(name):
     dz = full["Δz_aac"][:]
     eq, top = np.abs(lat) < EQ_BAND, z > -JET_DEPTH
     u, T = zonal["u"][:].astype(float), zonal["T"][:].astype(float)
+    ok = np.isfinite(u).all(axis=(1, 2)) & np.isfinite(T).all(axis=(1, 2))   # drop records written after a NaN
+    t, u, T = t[ok], u[ok], T[ok]
+    if len(t) < 2 or t[-1] < MIN_YEARS:
+        return None
 
     jet = np.array([np.average(u[i][top][:, eq].mean(axis=1), weights=dz[top]) for i in range(len(t))])
     window = t >= t[-1] - min(1.0, t[-1] / 2)               # last model year (or last half of a short run)
@@ -99,6 +104,9 @@ def main():
         print(f"No jetres_* runs found in {OCEAN_DIR}")
         return
     results = {key: analyse(name) for key, name in sorted(runs.items())}
+    for key in [k for k, r in results.items() if r is None]:
+        print(f"Skipping {runs[key]}: under {MIN_YEARS} model yr of valid output (crashed?)")
+        del results[key]
     resolutions = sorted({res for _, res in results}, reverse=True)
 
     print(f"{'scheme':9s} {'res':>5s} {'years':>6s} {'jet (m/s)':>16s} {'core (m)':>9s} {'half-width (°)':>15s} "
@@ -107,7 +115,7 @@ def main():
         errors = []
         for ref in REFERENCES:
             ref_run = results.get((ref, 0.25))
-            errors.append(f"{100 * (r['jet_final'] - ref_run['jet_final']) / ref_run['jet_final']:+6.1f}%" if ref_run else "     —")
+            errors.append(f"{100 * (r['jet_final'] - ref_run['jet_final']) / ref_run['jet_final']:+6.1f}%" if ref_run else "      —")
         print(f"{scheme:9s} {res:5.2f} {r['t'][-1]:6.2f} {r['jet_final']:9.3f} ± {r['jet_std']:.3f} {r['core']:9.0f} "
               f"{r['width'][0]:6.1f}..{r['width'][1]:<6.1f} {r['mean_T']:7.3f} {100 * r['noise_w']:7.1f}% {r['cost']:7.2f}  "
               + "      ".join(errors))

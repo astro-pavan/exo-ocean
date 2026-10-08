@@ -11,18 +11,19 @@ tidy(x) = isinteger(x) ? Int(x) : x
 levels_for(H) = findfirst(n -> last(ocean_z_faces(H, n)) <= 11.5, 1:60)    # as in deep_equilibrium.jl
 
 # One run with WENO5 momentum and UpwindBiased(3) tracers (T_night = 0, so T_day = ΔT); `cost` = expected minutes per model year
-function case(group, res, depth, P, dT; κ = 1e3, years, cost, cpu = false, warm = false)
-    name = "wenoval_$(tidy(res))deg_D$(tidy(depth))_P$(tidy(P))_dT$(tidy(dT))" * (κ == 1e3 ? "" : "_kh$(tidy(κ))") * (warm ? "_warm" : "")
-    return (; group, name, res, depth, P, dT, κ, years, cost, cpu, warm)
+function case(group, res, depth, P, dT; κ = 1e3, years, cost, cpu = false, warm = false, FT = Float32)
+    name = "wenoval_$(tidy(res))deg_D$(tidy(depth))_P$(tidy(P))_dT$(tidy(dT))" * (κ == 1e3 ? "" : "_kh$(tidy(κ))") * (warm ? "_warm" : "") *
+           (FT == Float64 ? "_f64" : "")
+    return (; group, name, res, depth, P, dT, κ, years, cost, cpu, warm, FT)
 end
 
 # Shorter Δt for faster rotation (inertial cap) and stronger flow (CFL)
-estimate_minutes(c) = c.cost * (c.P <= 3 ? 1.3 : 1.0) * (c.dT >= 50 ? 1.5 : 1.0) * c.years + 1
+estimate_minutes(c) = c.cost * (c.P <= 3 ? 1.3 : 1.0) * (c.dT >= 50 ? 1.5 : 1.0) * (c.FT == Float64 ? 1.3 : 1.0) * c.years + 1
 
 # MB per million cells, from the jetres files: 3D file (start + end) 38, zonal file 3.6 + 0.024 per record per (1°, 9 levels), checkpoint ~60
 megacells(c) = (360 / c.res) * (160 / c.res) * levels_for(c.depth) / 1e6
 output_mb(c) = 41.6 * megacells(c) + 0.024 * (levels_for(c.depth) / 9) / c.res * (10 * c.years + 1)
-checkpoint_mb(c) = 60 * megacells(c)
+checkpoint_mb(c) = 60 * megacells(c) * (c.FT == Float64 ? 2 : 1)
 
 function latest_checkpoint(dir, name)
     files = isdir(dir) ? filter(f -> occursin(Regex("^$(name)_iteration\\d+\\.jld2\$"), f), readdir(dir)) : String[]
@@ -108,7 +109,7 @@ function run_case(c, donor)
             try
                 ocean_simulation(c.name, c.P, Float64(c.depth), R_Earth, Float64(c.dT), 0.0, duration;
                                  n_lon = round(Int, 360 / c.res), n_lat = round(Int, 160 / c.res), n_depth = levels_for(c.depth),
-                                 use_GPU = !c.cpu, momentum_advection = :weno5, τ_biharmonic = nothing, κ_horizontal = c.κ,
+                                 use_GPU = !c.cpu, float_type = c.FT, momentum_advection = :weno5, τ_biharmonic = nothing, κ_horizontal = c.κ,
                                  max_Δt = min(3hours * c.res, default_max_Δt(nothing, c.P)),    # ≈ 2× the CFL Δt; inertially stable
                                  pickup, pickup_grid,
                                  output_interval = duration, zonal_mean_interval = min(36.5days, duration / 10),

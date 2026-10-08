@@ -27,6 +27,8 @@ end
 const REPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 const directory = get(ENV, "EXO_OCEAN_OUTPUT", joinpath(REPO_ROOT, "output"))
 
+include("emulator_wind.jl")
+
 #####
 ##### Grid
 #####
@@ -37,9 +39,9 @@ function ocean_z_faces(ocean_depth, n_depth; r = 1.2)
     return [-Δz₀ * (r^(n_depth - k) - 1) / (r - 1) for k in 0:n_depth], Δz₀
 end
 
-function ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo = (3, 3, 3))
+function ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo = (3, 3, 3), float_type = Float32)
     z_faces, _ = ocean_z_faces(ocean_depth, n_depth)
-    return LatitudeLongitudeGrid(arch, Float32;
+    return LatitudeLongitudeGrid(arch, float_type;
                                  size = (n_lon, n_lat, n_depth),
                                  halo,
                                  longitude = (-180, 180),
@@ -94,9 +96,14 @@ end
     return p.Δz_top * (T - T_eq) / p.τ_relax  # positive flux cools
 end
 
-function velocity_boundary_conditions(wind_field)
+# wind_stress = (τx, τy): kinematic stress arrays at u- and v-points (e.g. from emulator_wind_stress), used as array-valued top fluxes
+function velocity_boundary_conditions(wind_field, wind_stress = nothing)
     u_bottom = FluxBoundaryCondition(bottom_drag_u, discrete_form = true)
     v_bottom = FluxBoundaryCondition(bottom_drag_v, discrete_form = true)
+    if !isnothing(wind_stress)
+        return FieldBoundaryConditions(top = FluxBoundaryCondition(wind_stress[1]), bottom = u_bottom),
+               FieldBoundaryConditions(top = FluxBoundaryCondition(wind_stress[2]), bottom = v_bottom)
+    end
     isnothing(wind_field) && return FieldBoundaryConditions(bottom = u_bottom), FieldBoundaryConditions(bottom = v_bottom)
     p = (; wind_field)
     return FieldBoundaryConditions(top = FluxBoundaryCondition(wind_stress_u, parameters = p), bottom = u_bottom),
@@ -278,7 +285,7 @@ function progress_callback(model, T_drift_tol, T_drift_window)
     return progress
 end
 
-function add_output_writers!(simulation, name; output_interval, zonal_mean_interval, checkpoint_interval)
+function add_output_writers!(simulation, name; output_interval, zonal_mean_interval, checkpoint_interval, global_attributes = Dict())
     model = simulation.model
     ocean_dir = joinpath(directory, "ocean")
     mkpath(ocean_dir)
@@ -286,13 +293,13 @@ function add_output_writers!(simulation, name; output_interval, zonal_mean_inter
 
     if !isnothing(output_interval)
         simulation.output_writers[:full_3d] = NetCDFWriter(model, fields; filename = joinpath(ocean_dir, "$(name).nc"),
-                                                           schedule = TimeInterval(output_interval), overwrite_existing = true)
+                                                           schedule = TimeInterval(output_interval), overwrite_existing = true, global_attributes)
     end
 
     if !isnothing(zonal_mean_interval)
         zonal = map(f -> Field(Average(f, dims = 1)), fields)
         simulation.output_writers[:zonal_mean] = NetCDFWriter(model, zonal; filename = joinpath(ocean_dir, "$(name)_zonal.nc"),
-                                                              schedule = TimeInterval(zonal_mean_interval), overwrite_existing = true)
+                                                              schedule = TimeInterval(zonal_mean_interval), overwrite_existing = true, global_attributes)
     end
 
     if !isnothing(checkpoint_interval)
@@ -326,10 +333,15 @@ nightside). `rotational_period` is in Earth days (0 for no rotation). Output goe
 
 Keywords:
 - `n_lat`, `n_lon`, `n_depth`, `use_GPU`: grid and architecture.
+- `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
 - `τ_relax`, `τ_biharmonic`, `κ_horizontal`: SST relaxation time, grid-scale damping time of the biharmonic viscosity
   (`nothing` for none), horizontal tracer diffusivity (0 for none).
 - `momentum_advection` (`:centered`, `:weno5`, `:weno9`), `tracer_advection` (`:upwind3`, `:weno5`): advection schemes.
 - `wind_field`: `(lon, lat, t) -> (u_wind, v_wind)` in m/s for a bulk wind stress.
+- `emulator_wind`, `surface_pressure`: force with CLERO-emulated winds of the planet whose emulated (T_day, T_night) match this run's at
+  surface pressure `surface_pressure` (bar). The wind file is solved by `src/climate/climate_emulator.py` (Python env `\$EXO_EMULATOR_PYTHON`)
+  and cached in `\$EXO_OCEAN_OUTPUT/winds/`; errors if no planet matches. `emulator_gcm` (`"exocam"`/`"um"`), `emulator_feh` (stellar
+  [Fe/H]; default the nearby M-dwarf mean) and `emulator_device` (`"cpu"`/`"cuda"`) are passed through; `wind_stress_scale` multiplies the stress.
 - `salinity`: carry a passive salinity tracer initialised to this value (`nothing`: temperature only).
 - `cfl`, `max_Δt`: advective CFL target and timestep cap (default τ_biharmonic / 100 for biharmonic stability, else inertial stability).
 - `pickup`: checkpoint to warm-start from; `pickup_grid = (; n_lon, n_lat, n_depth, ocean_depth)` if it was written on another grid.
@@ -337,29 +349,39 @@ Keywords:
 - `output_interval`, `zonal_mean_interval`, `checkpoint_interval`: model time between 3D snapshots, zonal means and checkpoints (`nothing` for none).
 """
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
-                          n_lat = 160, n_lon = 360, n_depth = 20, use_GPU = true,
+                          n_lat = 160, n_lon = 360, n_depth = 20, use_GPU = true, float_type = Float32,
                           τ_relax = 30days, τ_biharmonic = 10days, κ_horizontal = 1e3,
                           momentum_advection = :centered, tracer_advection = :upwind3,
                           wind_field = nothing, salinity = nothing,
+                          emulator_wind = false, surface_pressure = nothing, emulator_gcm = "exocam", emulator_feh = nothing,
+                          emulator_device = nothing, wind_stress_scale = 1.0,
                           cfl = 0.2, max_Δt = default_max_Δt(τ_biharmonic, rotational_period),
                           pickup = nothing, pickup_grid = nothing,
                           T_drift_tol = nothing, T_drift_window = 10 * 365days,
                           output_interval = 5 * 365days, zonal_mean_interval = nothing, checkpoint_interval = nothing)
 
     @info "Setting up simulation $(simulation_name)..."
+    wind_file = nothing
+    if emulator_wind  # solve before the grid exists, so the Python GPU job has released its memory
+        isnothing(surface_pressure) && error("emulator_wind = true needs surface_pressure (bar)")
+        isnothing(wind_field) || error("pass either wind_field or emulator_wind, not both")
+        rotational_period > 0 || error("emulator_wind needs a rotating, tidally locked planet (rotational_period > 0)")
+        wind_file = emulator_wind_file(rotational_period, T_day, T_night, surface_pressure; gcm = emulator_gcm, feh = emulator_feh, device = emulator_device)
+    end
     arch = select_architecture(use_GPU)
     momentum = momentum_scheme(momentum_advection)
     tracers_adv = tracer_scheme(tracer_advection)
     closure = ocean_closure(; n_lon, n_lat, planet_radius, τ_biharmonic, κ_horizontal)
     halo = required_halo(momentum, tracers_adv, closure)
-    grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo)
+    grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type)
     _, Δz_top = ocean_z_faces(ocean_depth, n_depth)
 
     rotation_rate = rotational_period == 0 ? 0 : omega_Earth / rotational_period
     eos = LinearEquationOfState(thermal_expansion = 2e-4, haline_contraction = 0.0)
     buoyancy = isnothing(salinity) ? SeawaterBuoyancy(equation_of_state = eos, constant_salinity = 35.0) : SeawaterBuoyancy(equation_of_state = eos)
 
-    u_bcs, v_bcs = velocity_boundary_conditions(wind_field)
+    wind_stress = isnothing(wind_file) ? nothing : emulator_wind_stress(wind_file, grid; P_rot = rotational_period, scale = wind_stress_scale)
+    u_bcs, v_bcs = velocity_boundary_conditions(wind_field, wind_stress)
     relaxation = (; T_day, T_night, τ_relax, Δz_top)
     T_bcs = FieldBoundaryConditions(top = FluxBoundaryCondition(surface_relaxation, discrete_form = true, parameters = relaxation))
 
@@ -389,7 +411,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
 
     simulation.callbacks[:progress] = Callback(progress_callback(model, T_drift_tol, T_drift_window), IterationInterval(100))
     simulation.callbacks[:wizard] = Callback(TimeStepWizard(; cfl, max_change = 1.05, max_Δt), IterationInterval(10))
-    add_output_writers!(simulation, simulation_name; output_interval, zonal_mean_interval, checkpoint_interval)
+    global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale)
+    add_output_writers!(simulation, simulation_name; output_interval, zonal_mean_interval, checkpoint_interval, global_attributes)
 
     @info "Simulation setup complete. Starting the run..."
     run!(simulation, checkpoint_at_end = !isnothing(checkpoint_interval))

@@ -14,15 +14,7 @@
 include(joinpath(@__DIR__, "weno_validation_common.jl"))
 using NCDatasets
 
-const DIAG_FT = Ref{DataType}(Float32)
 const DIAG_HOOK = Ref{Any}(nothing)
-
-# Same grid as ocean_sim.jl with a selectable float type (overrides the Float32 version for this script only)
-function ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo = (3, 3, 3))
-    z_faces, _ = ocean_z_faces(ocean_depth, n_depth)
-    return LatitudeLongitudeGrid(arch, DIAG_FT[]; size = (n_lon, n_lat, n_depth), halo, longitude = (-180, 180),
-                                 latitude = (-80, 80), z = z_faces, radius = planet_radius, topology = (Periodic, Bounded, Bounded))
-end
 
 # Replaces the output writers: installs the watch, plus no-op callbacks on the original output schedules, because
 # Oceananigans shortens Δt to land on scheduled times and the rerun must take exactly the same steps as the H100 run
@@ -126,7 +118,6 @@ function verdict(c, W, nan_logged, iterations_run)
 end
 
 function diagnose(c, out_dir)
-    DIAG_FT[] = c.FT
     W = Watch(c.from, c.to, nothing, nothing, String[], nothing)
     DIAG_HOOK[] = function (sim)
         m = sim.model
@@ -147,7 +138,7 @@ function diagnose(c, out_dir)
             try
                 ocean_simulation(c.name, c.P, 200.0, R_Earth, 30.0, 0.0, 10 * 365days;
                                  n_lon = round(Int, 360 / c.res), n_lat = round(Int, 160 / c.res), n_depth = levels_for(200),
-                                 use_GPU = c.gpu, momentum_advection = :weno5, τ_biharmonic = c.τ, κ_horizontal = 1e3,
+                                 use_GPU = c.gpu, float_type = c.FT, momentum_advection = :weno5, τ_biharmonic = c.τ, κ_horizontal = 1e3,
                                  max_Δt = min(3hours * c.res, default_max_Δt(c.τ, c.P), default_max_Δt(nothing, c.P)),
                                  output_interval = nothing, zonal_mean_interval = nothing, checkpoint_interval = nothing)
             catch err

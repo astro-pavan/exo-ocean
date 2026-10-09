@@ -8,7 +8,7 @@ include(joinpath(@__DIR__, "..", "..", "src", "ocean", "ocean_sim.jl"))
 const VALIDATION_COMMON = @__FILE__
 const SCRIPT_START = time()
 const DONOR_1KM = "deepeq_P_10_dT_30.0_D_1"    # 1° biharmonic equilibrium that the weno_validation_a400.jl runs regrid from
-const H100_TOTAL_HOURS = 7.5                    # pod hours for all h100_test_*.jl scripts together ($30 at $3.5/h, less setup)
+const H100_TOTAL_HOURS = 8.5                    # pod hours for all h100_test_*.jl scripts together (~$34 at $3.5/h with setup)
 const H100_RATE = 3.5                           # $ per hour
 
 dry_run() = "--dry-run" in ARGS || get(ENV, "H100_TESTS_DRYRUN", "0") == "1"
@@ -24,25 +24,26 @@ One run with WENO5 momentum (T_night = 0, so T_day = ΔT); `cost` = expected min
 stops at deep equilibrium, with `years` as the cap and `est_years` the expected length; `P0` (bar) adds CLERO emulator wind stress.
 """
 function case(group, res, depth, P, dT; κ = 1e3, years, cost, cpu = false, warm = false, FT = Float32, prefix = "wenoval",
-              ν_v = 1e-4, κ_v = 1e-4, tracer = :upwind3, P0 = nothing, wind_scale = 1.0, pickup = nothing, drift = nothing,
+              ν_v = 1e-4, κ_v = 1e-4, nz_factor = 1, tracer = :upwind3, P0 = nothing, wind_scale = 1.0, pickup = nothing, drift = nothing,
               est_years = years)
     warm && (pickup = (name = DONOR_1KM, res = 1.0, depth = 1000))
     name = "$(prefix)_$(tidy(res))deg_D$(tidy(depth))_P$(tidy(P))_dT$(tidy(dT))" *
            (κ == 1e3 ? "" : "_kh$(tidy(κ))") *
            (tracer == :upwind3 ? "" : "_tr$(tracer)") *
            (ν_v == 1e-4 && κ_v == 1e-4 ? "" : "_nu$(sci(ν_v))_kv$(sci(κ_v))") *
+           (nz_factor == 1 ? "" : "_nz$(nz_factor * levels_for(depth))") *
            (isnothing(P0) ? "" : "_windP$(tidy(P0))" * (wind_scale == 1 ? "" : "x$(tidy(wind_scale))")) *
            (warm ? "_warm" : isnothing(pickup) ? "" : "_from$(tidy(pickup.res))deg") *
            (FT == Float64 ? "_f64" : "")
-    return (; group, name, res, depth, P, dT, κ, years, cost, cpu, FT, ν_v, κ_v, tracer, P0, wind_scale, pickup, drift, est_years)
+    return (; group, name, res, depth, P, dT, κ, years, cost, cpu, FT, ν_v, κ_v, nz_factor, tracer, P0, wind_scale, pickup, drift, est_years)
 end
 
 # Shorter Δt for faster rotation (inertial cap) and stronger flow (CFL); Float64 costs ~1.3× on the H100
-estimate_minutes(c) = c.cost * (c.P <= 3 ? 1.3 : 1.0) * (c.dT >= 50 ? 1.5 : 1.0) * (c.FT == Float64 ? 1.3 : 1.0) * c.est_years + 1
+estimate_minutes(c) = c.cost * c.nz_factor * (c.P <= 3 ? 1.3 : 1.0) * (c.dT >= 50 ? 1.5 : 1.0) * (c.FT == Float64 ? 1.3 : 1.0) * c.est_years + 1
 
 # MB per million cells, from the jetres files: 3D file (start + end) 38, zonal file 3.6 + 0.024 per record per (1°, 9 levels), checkpoint ~60
-megacells(c) = (360 / c.res) * (160 / c.res) * levels_for(c.depth) / 1e6
-output_mb(c) = 41.6 * megacells(c) + 0.024 * (levels_for(c.depth) / 9) / c.res * (10 * c.est_years + 1)
+megacells(c) = (360 / c.res) * (160 / c.res) * c.nz_factor * levels_for(c.depth) / 1e6
+output_mb(c) = 41.6 * megacells(c) + 0.024 * (c.nz_factor * levels_for(c.depth) / 9) / c.res * (10 * c.est_years + 1)
 checkpoint_mb(c) = 60 * megacells(c) * (c.FT == Float64 ? 2 : 1)
 
 function latest_checkpoint(dir, name)
@@ -169,7 +170,8 @@ function run_case(c, _ = nothing)
                                    n_depth = levels_for(c.pickup.depth), ocean_depth = Float64(c.pickup.depth))
                 end
                 ocean_simulation(c.name, c.P, Float64(c.depth), R_Earth, Float64(c.dT), 0.0, duration;
-                                 n_lon = round(Int, 360 / c.res), n_lat = round(Int, 160 / c.res), n_depth = levels_for(c.depth),
+                                 n_lon = round(Int, 360 / c.res), n_lat = round(Int, 160 / c.res), n_depth = c.nz_factor * levels_for(c.depth),
+                                 vertical_stretching = 1.2^(1 / c.nz_factor),    # splits each default cell into nz_factor cells
                                  use_GPU = !c.cpu, float_type = c.FT, momentum_advection = :weno5, τ_biharmonic = nothing,
                                  κ_horizontal = c.κ, tracer_advection = c.tracer, ν_vertical = c.ν_v, κ_vertical = c.κ_v,
                                  emulator_wind = !isnothing(c.P0), surface_pressure = c.P0, wind_stress_scale = c.wind_scale,

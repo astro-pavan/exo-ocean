@@ -39,8 +39,8 @@ function ocean_z_faces(ocean_depth, n_depth; r = 1.2)
     return [-Δz₀ * (r^(n_depth - k) - 1) / (r - 1) for k in 0:n_depth], Δz₀
 end
 
-function ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo = (3, 3, 3), float_type = Float32)
-    z_faces, _ = ocean_z_faces(ocean_depth, n_depth)
+function ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo = (3, 3, 3), float_type = Float32, r = 1.2)
+    z_faces, _ = ocean_z_faces(ocean_depth, n_depth; r)
     return LatitudeLongitudeGrid(arch, float_type;
                                  size = (n_lon, n_lat, n_depth),
                                  halo,
@@ -333,6 +333,7 @@ nightside). `rotational_period` is in Earth days (0 for no rotation). Output goe
 
 Keywords:
 - `n_lat`, `n_lon`, `n_depth`, `use_GPU`: grid and architecture.
+- `vertical_stretching`: thickness ratio of adjacent vertical cells (√1.2 with 2× `n_depth` halves every default cell).
 - `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
 - `τ_relax`, `τ_biharmonic`, `κ_horizontal`: SST relaxation time, grid-scale damping time of the biharmonic viscosity
   (`nothing` for none), horizontal tracer diffusivity (0 for none).
@@ -350,7 +351,7 @@ Keywords:
 - `output_interval`, `zonal_mean_interval`, `checkpoint_interval`: model time between 3D snapshots, zonal means and checkpoints (`nothing` for none).
 """
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
-                          n_lat = 160, n_lon = 360, n_depth = 20, use_GPU = true, float_type = Float32,
+                          n_lat = 160, n_lon = 360, n_depth = 20, use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
                           τ_relax = 30days, τ_biharmonic = 10days, κ_horizontal = 1e3, ν_vertical = 1e-4, κ_vertical = 1e-4,
                           momentum_advection = :centered, tracer_advection = :upwind3,
                           wind_field = nothing, salinity = nothing,
@@ -374,8 +375,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     tracers_adv = tracer_scheme(tracer_advection)
     closure = ocean_closure(; n_lon, n_lat, planet_radius, τ_biharmonic, κ_horizontal, ν_vertical, κ_vertical)
     halo = required_halo(momentum, tracers_adv, closure)
-    grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type)
-    _, Δz_top = ocean_z_faces(ocean_depth, n_depth)
+    grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching)
+    _, Δz_top = ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)
 
     rotation_rate = rotational_period == 0 ? 0 : omega_Earth / rotational_period
     eos = LinearEquationOfState(thermal_expansion = 2e-4, haline_contraction = 0.0)

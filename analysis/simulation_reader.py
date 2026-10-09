@@ -146,6 +146,7 @@ class SimulationData:
         self.lon  = np.array(lon)
         self.lat  = np.array(lat)
         self.z    = np.array(z)
+        self.radius = float(ds['Δy_cca'].values.flat[0] / np.radians(np.diff(self.lat[:2])[0]))  # planet radius from grid metrics
         self.u    = np.array(u_raw)
         self.v    = v
         self.w    = w

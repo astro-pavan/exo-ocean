@@ -111,14 +111,14 @@ function velocity_boundary_conditions(wind_field, wind_stress = nothing)
 end
 
 # τ_biharmonic = nothing omits the biharmonic viscosity and κ_horizontal = 0 the horizontal tracer diffusivity
-function ocean_closure(; n_lon, n_lat, planet_radius, τ_biharmonic, κ_horizontal)
+function ocean_closure(; n_lon, n_lat, planet_radius, τ_biharmonic, κ_horizontal, ν_vertical = 1e-4, κ_vertical = 1e-4)
     R = Float64(planet_radius)
     Δλ = 2π / n_lon
     Δy = deg2rad(160) / n_lat * R
     ν₄(λ, φ, z, t) = min(Δλ * R * cosd(φ), Δy)^4 / τ_biharmonic  # same grid-scale damping time everywhere
     biharmonic = isnothing(τ_biharmonic) ? nothing : HorizontalScalarBiharmonicDiffusivity(ν = ν₄)
     horizontal = iszero(κ_horizontal) ? nothing : HorizontalScalarDiffusivity(κ = κ_horizontal)
-    closures = (VerticalScalarDiffusivity(ν = 1e-4, κ = 1e-4), biharmonic, horizontal,
+    closures = (VerticalScalarDiffusivity(ν = ν_vertical, κ = κ_vertical), biharmonic, horizontal,
                 ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0))
     return Tuple(c for c in closures if !isnothing(c))
 end
@@ -336,6 +336,7 @@ Keywords:
 - `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
 - `τ_relax`, `τ_biharmonic`, `κ_horizontal`: SST relaxation time, grid-scale damping time of the biharmonic viscosity
   (`nothing` for none), horizontal tracer diffusivity (0 for none).
+- `ν_vertical`, `κ_vertical`: background vertical viscosity and tracer diffusivity (m²/s).
 - `momentum_advection` (`:centered`, `:weno5`, `:weno9`), `tracer_advection` (`:upwind3`, `:weno5`): advection schemes.
 - `wind_field`: `(lon, lat, t) -> (u_wind, v_wind)` in m/s for a bulk wind stress.
 - `emulator_wind`, `surface_pressure`: force with CLERO-emulated winds of the planet whose emulated (T_day, T_night) match this run's at
@@ -350,7 +351,7 @@ Keywords:
 """
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
                           n_lat = 160, n_lon = 360, n_depth = 20, use_GPU = true, float_type = Float32,
-                          τ_relax = 30days, τ_biharmonic = 10days, κ_horizontal = 1e3,
+                          τ_relax = 30days, τ_biharmonic = 10days, κ_horizontal = 1e3, ν_vertical = 1e-4, κ_vertical = 1e-4,
                           momentum_advection = :centered, tracer_advection = :upwind3,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, surface_pressure = nothing, emulator_gcm = "exocam", emulator_feh = nothing,
@@ -371,7 +372,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     arch = select_architecture(use_GPU)
     momentum = momentum_scheme(momentum_advection)
     tracers_adv = tracer_scheme(tracer_advection)
-    closure = ocean_closure(; n_lon, n_lat, planet_radius, τ_biharmonic, κ_horizontal)
+    closure = ocean_closure(; n_lon, n_lat, planet_radius, τ_biharmonic, κ_horizontal, ν_vertical, κ_vertical)
     halo = required_halo(momentum, tracers_adv, closure)
     grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type)
     _, Δz_top = ocean_z_faces(ocean_depth, n_depth)

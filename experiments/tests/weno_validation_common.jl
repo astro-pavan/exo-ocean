@@ -1,4 +1,4 @@
-# Shared code for the weno_validation_*.jl and h100_test_*.jl scripts: run definitions, per-run logs, the scheduler and the H100 budget.
+# Shared code for the weno_validation_*.jl and h100_test_*.jl scripts: run definitions, per-run logs and the scheduler.
 # Optional (local checks only): --dry-run or H100_TESTS_DRYRUN=1 prints the plan and estimates; --smoke or H100_TESTS_SMOKE=1 runs
 # every case 4× coarser (at most 8°) for 20 model days; --force reruns cases already marked ok in the summary (otherwise an
 # interrupted session resumes where it stopped).
@@ -8,8 +8,6 @@ include(joinpath(@__DIR__, "..", "..", "src", "ocean", "ocean_sim.jl"))
 const VALIDATION_COMMON = @__FILE__
 const SCRIPT_START = time()
 const DONOR_1KM = "deepeq_P_10_dT_30.0_D_1"    # 1° biharmonic equilibrium that the weno_validation_a400.jl runs regrid from
-const H100_TOTAL_HOURS = 8.5                    # pod hours for all h100_test_*.jl scripts together (~$34 at $3.5/h with setup)
-const H100_RATE = 3.5                           # $ per hour
 
 dry_run() = "--dry-run" in ARGS || get(ENV, "H100_TESTS_DRYRUN", "0") == "1"
 smoke_mode() = "--smoke" in ARGS || get(ENV, "H100_TESTS_SMOKE", "0") == "1"
@@ -102,23 +100,6 @@ function plan(cases, label; n_workers, prefix = "wenoval")
     return todo, nothing, summary_path
 end
 
-# Hours this script may still start runs in: its own cap, limited by what the shared ledger says is left of H100_TOTAL_HOURS.
-# The session's hours (including compilation) are added to the ledger when Julia exits, also after Ctrl-C.
-function h100_budget(label, cap)
-    ledger = joinpath(directory, "ocean", "h100_budget.txt")
-    used = isfile(ledger) ? sum(parse(Float64, split(l)[end - 1]) for l in eachline(ledger) if !isempty(strip(l)); init = 0.0) : 0.0
-    left = H100_TOTAL_HOURS - used
-    @printf("H100 budget: %.2f h used by earlier scripts (\$%.0f), %.2f h left of %.1f; this script may start runs for %.2f h\n",
-            used, used * H100_RATE, left, H100_TOTAL_HOURS, max(min(cap, left), 0))
-    left <= 0 && (println("Budget exhausted; nothing to do. Ledger: $(ledger)"); exit())
-    if !dry_run() && !smoke_mode()
-        mkpath(dirname(ledger))
-        atexit(() -> open(io -> @printf(io, "%s  %-28s %.3f h\n", Dates.format(now(), "yyyy-mm-dd HH:MM"), label,
-                                       (time() - SCRIPT_START) / 3600), ledger, "a"))
-    end
-    return min(cap, left) - (time() - SCRIPT_START) / 3600
-end
-
 # Worker processes compile once each; they get LD_LIBRARY_PATH without CUDA paths so CUDA.jl loads its own libraries
 function start_workers(n; threads)
     cleaned = join(filter(p -> !occursin(r"cuda"i, p), split(get(ENV, "LD_LIBRARY_PATH", ""), ":", keepempty = false)), ":")
@@ -199,8 +180,8 @@ function run_case(c, _ = nothing)
 end
 
 # Each worker takes the longest remaining run whose warm-start donor (if it is in this script) has finished ok; runs whose donor failed
-# are skipped. No run starts after the budget (running ones finish).
-function run_all(todo, _, summary_path; budget_hours = Inf)
+# are skipped.
+function run_all(todo, _, summary_path)
     started = time()
     queue = copy(todo)
     names = Set(c.name for c in todo)
@@ -212,7 +193,7 @@ function run_all(todo, _, summary_path; budget_hours = Inf)
         open(io -> println(io, line), summary_path, "a")
     end
     @sync for w in workers()    # [1] when no workers were added
-        @async while !isempty(queue) && (time() - started) / 3600 < budget_hours
+        @async while !isempty(queue)
             for c in filter(c -> donor_state(c) in ("nan", "error", "skipped"), queue)
                 state[c.name] = "skipped"
                 record(c.name, "skipped", 0.0)
@@ -231,7 +212,5 @@ function run_all(todo, _, summary_path; budget_hours = Inf)
             record(r.name, r.status, r.minutes)
         end
     end
-    isempty(queue) || println("Budget reached; not started: ", join((c.name for c in queue), ", "))
-    @printf("Done in %.1f h (session %.1f h, ≈ \$%.0f at \$%.1f/h). Summary: %s\n", (time() - started) / 3600,
-            (time() - SCRIPT_START) / 3600, (time() - SCRIPT_START) / 3600 * H100_RATE, H100_RATE, summary_path)
+    @printf("Done in %.1f h (session %.1f h). Summary: %s\n", (time() - started) / 3600, (time() - SCRIPT_START) / 3600, summary_path)
 end

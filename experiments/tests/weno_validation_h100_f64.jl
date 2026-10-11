@@ -16,4 +16,4 @@ cases = [f64(0.25, 10), f64(0.25, 3), f64(0.5, 50)]
 todo, donor, summary_path = plan(cases, "h100_f64"; n_workers = 2)
 start_workers(2; threads = 4)
 @everywhere workers() include($VALIDATION_COMMON)
-run_all(todo, donor, summary_path; budget_hours = 3)
+run_all(todo, donor, summary_path)

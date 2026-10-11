@@ -1,6 +1,6 @@
 # Is WENO5 at 1° good enough for the sweeps? Cold-start resolution checks across the sweep's P and ΔT range, for a rented H100 (≤ 4 h).
 #   julia --project=. experiments/tests/weno_validation_h100.jl
-# 200 m ocean, 10 model years per run (mean T within ~0.25 °C of equilibrium), two runs at a time, none started after 3.25 h:
+# 200 m ocean, 10 model years per run (mean T within ~0.25 °C of equilibrium), two runs at a time:
 #   baseline  P 10 d, ΔT 30 K at 1°, 0.5°, 0.25°
 #   edges     P 3 d ΔT 30 K (1°, 0.5°, 0.25°: narrowest jet); P 3 d ΔT 50 K, P 10 d ΔT 1 K, P 50 d ΔT 30 K (1°, 0.5°)
 #   kappa     P 10 d, ΔT 30 K at 1° with κ_h = 300 and 3000 m²/s (default 1000)
@@ -20,4 +20,4 @@ cases = [
 todo, donor, summary_path = plan(cases, "h100"; n_workers = 2)
 start_workers(2; threads = 4)
 @everywhere workers() include($VALIDATION_COMMON)
-run_all(todo, donor, summary_path; budget_hours = 3.25)
+run_all(todo, donor, summary_path)

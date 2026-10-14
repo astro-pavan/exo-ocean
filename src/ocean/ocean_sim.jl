@@ -264,9 +264,20 @@ end
 function record_restart!(name, entry)
     data = read_parameters(name)
     push!(get!(data, "restarts", Any[]), Dict{String, Any}(String(k) => string(v) for (k, v) in pairs(entry)))
+    delete!(data, "finished")    # running again
     open(io -> TOML.print(io, data; sorted = true), parameter_file(name), "w")
     return nothing
 end
+
+# Mark a run as finished in its parameter file, with the model time reached (s) and what stopped it
+function record_finished!(name, model_time, stopped_by)
+    data = read_parameters(name)
+    data["finished"] = Dict{String, Any}("model_time" => model_time, "stopped_by" => stopped_by)
+    open(io -> TOML.print(io, data; sorted = true), parameter_file(name), "w")
+    return nothing
+end
+
+is_finished(name) = isfile(parameter_file(name)) && haskey(read_parameters(name), "finished")
 
 # Latest checkpoint <name>_iteration<N>.jld2 of a run
 function latest_checkpoint(name)
@@ -291,39 +302,68 @@ same_grid(a, b) = all(getfield(a, k) == getfield(b, k) for k in (:n_lon, :n_lat,
 ##### Diagnostics and output
 #####
 
-# Log progress every call; stop when the trend of volume-mean T over T_drift_window falls below T_drift_tol (°C/yr)
-function progress_callback(model, T_drift_tol, T_drift_window)
+#####
+##### Deep-equilibrium stopping
+#####
+
+# Area-mean net surface heat flux into the ocean (W/m², positive warms) from the SST restoring, as a function of the current state
+function surface_heat_flux(model, relaxation)
+    grid = model.grid
+    λ, φ = Array(λnodes(grid, Center())), Array(φnodes(grid, Center()))
+    area = diff(sind.(Array(φnodes(grid, Face()))))    # cell area ∝ Δ(sin φ) at uniform Δλ
+    weights = [a for _ in λ, a in area] ./ (length(λ) * sum(area))
+    T_eq = [relaxation.T_night + (relaxation.T_day - relaxation.T_night) * max(0, cosd(l) * cosd(p)) for l in λ, p in φ]
+    Nz = size(grid, 3)
+    return () -> rho_seawater * cp_seawater * relaxation.W * sum(weights .* (T_eq .- Array(view(interior(model.tracers.T), :, :, Nz))))
+end
+
+# Gregory-style projection (Gregory et al. 2004, GRL 31, L03205): regress H on ⟨T⟩, extrapolate to H = 0, and return the remaining
+# change T∞ − ⟨T⟩ (°C) and the mean H; the change is NaN when H doesn't fall as ⟨T⟩ rises, i.e. no drift is left to fit, only noise
+function projected_change(T, H)
+    b = sum((T .- mean(T)) .* (H .- mean(H))) / sum((T .- mean(T)) .^ 2)
+    return (b < 0 ? mean(T) - mean(H) / b - T[end] : NaN), mean(H)
+end
+
+# Deep-equilibrium test over the last `window` of model time: stop once the projected remaining change of ⟨T⟩ is below `tol` (°C),
+# or, when only noise is left to fit, once the window-mean surface heat flux is below `flux_tol` (W/m²)
+function equilibrium_check(tol, window; flux_tol = 0.1)
+    history = NTuple{3, Float64}[]
+    function check!(sim, t, T̄, H)
+        push!(history, (t, T̄, H))
+        filter!(s -> t - s[1] <= window, history)
+        (length(history) >= 3 && t - history[1][1] >= 0.99 * window) || return NaN
+        gap, H̄ = projected_change(getindex.(history, 2), getindex.(history, 3))
+        if isfinite(gap) ? abs(gap) < tol : abs(H̄) < flux_tol
+            @info "Deep equilibrium: projected remaining change of ⟨T⟩ $(round(gap, sigdigits=2)) °C (tolerance $(tol) °C), mean surface " *
+                  "heat flux $(round(H̄, sigdigits=2)) W/m² over the last $(round(window / 365days, digits=1)) years. Stopping at $(prettytime(t))."
+            sim.running = false
+        end
+        return gap
+    end
+    return check!
+end
+
+#####
+##### Diagnostics and output
+#####
+
+# Log progress every call, and stop at deep equilibrium if `equilibrium` is an `equilibrium_check`
+function progress_callback(model, heat_flux, equilibrium)
     mean_T = Field(Average(model.tracers.T))
     mean_KE = Field(Average(@at (Center, Center, Center) (model.velocities.u^2 + model.velocities.v^2 + model.velocities.w^2) / 2))
-    previous = Ref((t = 0.0, T = NaN))
-    history = Tuple{Float64, Float64}[]
 
     function progress(sim)
         compute!(mean_T)
         compute!(mean_KE)
         T̄ = Array(interior(mean_T))[1]
         KE = Array(interior(mean_KE))[1]
+        H = heat_flux()
         t = sim.model.clock.time
-        dT̄dt = isfinite(previous[].T) && t > previous[].t ? (T̄ - previous[].T) / (t - previous[].t) * 365days : NaN
-        previous[] = (; t, T = T̄)
+        gap = isnothing(equilibrium) || !isfinite(T̄) ? NaN : equilibrium(sim, t, T̄, H)
 
         @info "Time: $(prettytime(t)), Δt: $(prettytime(sim.Δt)), CFL: $(round(AdvectiveCFL(sim.Δt)(sim.model), digits=3)), " *
-              "⟨T⟩: $(round(T̄, digits=3)) °C (d⟨T⟩/dt: $(round(dT̄dt, digits=3)) °C/yr), ⟨KE⟩: $(round(KE, sigdigits=3)) m²/s²"
-
-        if !isnothing(T_drift_tol) && isfinite(T̄)
-            push!(history, (t, T̄))
-            filter!(s -> t - s[1] <= T_drift_window, history)
-            if length(history) >= 3 && history[end][1] - history[1][1] >= 0.99 * T_drift_window
-                years = first.(history) ./ 365days
-                temps = last.(history)
-                trend = sum((years .- mean(years)) .* (temps .- mean(temps))) / sum((years .- mean(years)) .^ 2)
-                if abs(trend) < T_drift_tol
-                    @info "Deep equilibrium: ⟨T⟩ trend $(round(trend, sigdigits=2)) °C/yr (|.| < $(T_drift_tol)) over the last " *
-                          "$(round((history[end][1] - history[1][1]) / 365days, digits=1)) years. Stopping at $(prettytime(t))."
-                    sim.running = false
-                end
-            end
-        end
+              "⟨T⟩: $(round(T̄, digits=3)) °C, surface heat flux: $(round(H, sigdigits=3)) W/m², ⟨KE⟩: $(round(KE, sigdigits=3)) m²/s²" *
+              (isfinite(gap) ? ", projected ⟨T⟩ change: $(round(gap, sigdigits=2)) °C" : "")
     end
 
     return progress
@@ -343,12 +383,12 @@ function add_output_writers!(simulation, name; output_interval, snapshot_interva
 
     if !isnothing(snapshot_interval)
         Nz = size(model.grid, 3)
-        section = map(f -> Field(Average(f, dims = 1)), fields)       # zonal mean (lat × z)
-        surface = map(f -> Field(f; indices = (:, :, Nz)), fields)    # top cell (lat × lon); w on the top cell's lower face
-        for (key, outputs) in ((:section, section), (:surface, surface))
-            simulation.output_writers[key] = NetCDFWriter(model, outputs; filename = joinpath(ocean_dir, "$(name)_$(key).nc"),
-                                                          schedule = TimeInterval(snapshot_interval), overwrite_existing = !append, global_attributes)
-        end
+        section = map(f -> Field(Average(f, dims = 1)), fields)    # zonal mean (lat × z)
+        simulation.output_writers[:section] = NetCDFWriter(model, section; filename = joinpath(ocean_dir, "$(name)_section.nc"),
+                                                           schedule = TimeInterval(snapshot_interval), overwrite_existing = !append, global_attributes)
+        # top cell (lat × lon); w on the top cell's lower face. The writer slices, so the file's z coordinate matches the outputs
+        simulation.output_writers[:surface] = NetCDFWriter(model, fields; filename = joinpath(ocean_dir, "$(name)_surface.nc"), indices = (:, :, Nz),
+                                                           schedule = TimeInterval(snapshot_interval), overwrite_existing = !append, global_attributes)
     end
 
     if !isnothing(checkpoint_interval)
@@ -392,8 +432,8 @@ Keywords:
 - `wind_field`: `(lon, lat, t) -> (u_wind, v_wind)` in m/s for a bulk wind stress.
 - `emulator_wind`, `surface_pressure`: force with CLERO-emulated winds of the planet whose emulated (T_day, T_night) match this run's at
   surface pressure `surface_pressure` (bar). The wind file is solved by `src/climate/climate_emulator.py` (Python env `\$EXO_EMULATOR_PYTHON`)
-  and cached in `\$EXO_OCEAN_OUTPUT/winds/`; errors if no planet matches. `emulator_gcm` (`"exocam"`/`"um"`), `emulator_feh` (stellar
-  [Fe/H]; default the nearby M-dwarf mean) and `emulator_device` (`"cpu"`/`"cuda"`) are passed through; `wind_stress_scale` multiplies the stress.
+  and cached in `\$EXO_OCEAN_OUTPUT/winds/`; errors if no planet matches. Uses the ExoCAM emulator and the nearby M-dwarf mean [Fe/H];
+  `wind_stress_scale` multiplies the stress.
 - `salinity`: carry a passive salinity tracer initialised to this value (`nothing`: temperature only).
 - `cfl`, `max_Δt`: advective CFL target and timestep cap (inertial stability).
 - `restart`: name of a run to continue from its latest checkpoint for a further `simulation_time` (`simulation_name` must be the same).
@@ -401,7 +441,8 @@ Keywords:
   to its existing files. Other settings come from this call, so pass the same ones to continue the run unchanged.
 - `warm_start`: name of a run whose latest checkpoint starts this new run (clock at 0, new output files). Its parameter file gives
   the donor grid: on the same grid the state is copied exactly, otherwise T, u, v are interpolated onto this run's grid.
-- `T_drift_tol`, `T_drift_window`: stop when the trend of volume-mean T over the window falls below this (°C/yr).
+- `equilibrium_tol`, `equilibrium_window`: stop at deep equilibrium, when the Gregory-style projected remaining change of volume-mean T
+  over the window is below `equilibrium_tol` (°C); see `equilibrium_check`. `nothing` runs for the full `simulation_time`.
 - `output_interval`, `snapshot_interval`, `checkpoint_interval`: model time between 3D snapshots, `_section` (zonal-mean lat × z) and
   `_surface` (top-cell lat × lon) snapshots, and checkpoints (`nothing` for none).
 """
@@ -410,11 +451,10 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                           use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
                           κ_horizontal = 1e3, ν_vertical = 1e-4, κ_vertical = 1e-4,
                           wind_field = nothing, salinity = nothing,
-                          emulator_wind = false, surface_pressure = nothing, emulator_gcm = "exocam", emulator_feh = nothing,
-                          emulator_device = nothing, wind_stress_scale = 1.0,
+                          emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0,
                           cfl = 0.2, max_Δt = nothing,
                           restart = nothing, warm_start = nothing,
-                          T_drift_tol = nothing, T_drift_window = 10 * 365days,
+                          equilibrium_tol = nothing, equilibrium_window = 10 * 365days,
                           output_interval = 5 * 365days, snapshot_interval = 36.5days, checkpoint_interval = nothing)
 
     @info "Setting up simulation $(simulation_name)..."
@@ -438,7 +478,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         isnothing(surface_pressure) && error("emulator_wind = true needs surface_pressure (bar)")
         isnothing(wind_field) || error("pass either wind_field or emulator_wind, not both")
         rotational_period > 0 || error("emulator_wind needs a rotating, tidally locked planet (rotational_period > 0)")
-        wind_file = emulator_wind_file(rotational_period, T_day, T_night, surface_pressure; gcm = emulator_gcm, feh = emulator_feh, device = emulator_device)
+        wind_file = emulator_wind_file(rotational_period, T_day, T_night, surface_pressure)
     end
 
     # Sets up model settings
@@ -495,14 +535,15 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
                     z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
             physics = (; κ_horizontal, ν_vertical, κ_vertical, heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity,
-                       wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure, emulator_gcm,
-                       emulator_feh, wind_file, wind_stress_scale),
-            time = (; simulation_time, cfl, max_Δt, T_drift_tol, T_drift_window, output_interval, snapshot_interval, checkpoint_interval),
+                       wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
+                       wind_file, wind_stress_scale),
+            time = (; simulation_time, cfl, max_Δt, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval),
             warm_start = (; donor = warm_start, regridded = regrid,
                           checkpoint = isnothing(warm_start) ? nothing : latest_checkpoint(warm_start))))
     end
 
-    simulation.callbacks[:progress] = Callback(progress_callback(model, T_drift_tol, T_drift_window), IterationInterval(100))
+    equilibrium = isnothing(equilibrium_tol) ? nothing : equilibrium_check(equilibrium_tol, equilibrium_window)
+    simulation.callbacks[:progress] = Callback(progress_callback(model, surface_heat_flux(model, relaxation), equilibrium), IterationInterval(100))
     simulation.callbacks[:wizard] = Callback(TimeStepWizard(; cfl, max_change = 1.05, max_Δt), IterationInterval(10))
     global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale)
     add_output_writers!(simulation, simulation_name; output_interval, snapshot_interval, checkpoint_interval, global_attributes,
@@ -519,6 +560,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     @info "Simulation setup complete. Starting the run..."
     run!(simulation, checkpoint_at_end = !isnothing(checkpoint_interval))
     write_final_snapshot!(simulation)
+    t = simulation.model.clock.time
+    record_finished!(simulation_name, Float64(t), t >= simulation.stop_time ? "stop_time" : "equilibrium")
     @info "Simulation finished successfully!"
 
     return nothing

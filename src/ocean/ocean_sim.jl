@@ -9,6 +9,7 @@ using Oceananigans.Fields: interpolate
 using Oceananigans.Grids: λnode, φnode
 using NCDatasets
 using Statistics
+using TOML
 
 const CUDA_AVAILABLE = try
     using CUDA
@@ -51,6 +52,13 @@ function ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, hal
                                  topology = (Periodic, Bounded, Bounded))
 end
 
+# Number of cells of width `res` degrees across `span` degrees; errors unless they fit exactly
+function grid_cells(span, res, direction)
+    n = span / res
+    isapprox(n, round(n); atol = 1e-6) || error("a $(res)° $(direction) resolution doesn't divide the $(span)° span into whole cells")
+    return round(Int, n)
+end
+
 function select_architecture(use_GPU)
     use_GPU || return CPU()
     CUDA_AVAILABLE && return GPU()
@@ -86,14 +94,14 @@ end
     return -rho_air * C_D_wind * sqrt(u_wind^2 + v_wind^2) * v_wind / rho_seawater
 end
 
-# Relax SST toward a day-night equilibrium (hottest at the substellar point) as a flux with piston velocity Δz_top / τ_relax (Haney 1971)
+# Relax SST toward a day-night equilibrium (hottest at the substellar point) with a fixed piston velocity p.W = λ / ρc_p (Haney 1971)
 @inline function surface_relaxation(i, j, grid, clock, fields, p)
     k = grid.Nz
     lon_rad = λnode(i, j, k, grid, Center(), Center(), Center()) * π / 180
     lat_rad = φnode(i, j, k, grid, Center(), Center(), Center()) * π / 180
     T = @inbounds fields.T[i, j, k]
     T_eq = p.T_night + (p.T_day - p.T_night) * max(zero(lon_rad), cos(lon_rad) * cos(lat_rad))
-    return p.Q2 * (T - T_eq)  # positive flux cools
+    return p.W * (T - T_eq)  # positive flux cools
 end
 
 # wind_stress = (τx, τy): kinematic stress arrays at u- and v-points (e.g. from emulator_wind_stress), used as array-valued top fluxes
@@ -125,10 +133,10 @@ function required_halo(momentum, tracers, closure, max_lat=80)
     return Oceananigans.Grids.inflate_halo_size(3, 3, 3, probe, momentum, tracers, closure)
 end
 
-# Timestep cap: otherwise inertial stability (f Δt ≤ 0.4 at 80°)
-function default_max_Δt(rotational_period)
+# Timestep cap: otherwise inertial stability (f Δt ≤ 0.4 at the grid's highest latitude)
+function default_max_Δt(rotational_period, max_lat = 80)
     rotational_period == 0 && return 1days
-    return min(1days, 0.4 / (2 * omega_Earth / rotational_period * sind(80)))
+    return min(1days, 0.4 / (2 * omega_Earth / rotational_period * sind(max_lat)))
 end
 
 #####
@@ -139,35 +147,36 @@ end
 drop_state_key(x, key) = x
 drop_state_key(nt::NamedTuple, key) = (; (name => drop_state_key(value, key) for (name, value) in pairs(nt) if name != key)...)
 
-# Restore a same-grid checkpoint, then restart the clock and Δt for a fresh run
-function restore_checkpoint!(simulation, path; drop_salinity)
+# Restore a same-grid checkpoint (model, Δt and the schedules of output writers already added); reset_clock starts a fresh run from it
+function restore_checkpoint!(simulation, path; drop_salinity, reset_clock)
     state = Oceananigans.OutputWriters.load_checkpoint_state(path)
     drop_salinity && (state = drop_state_key(state, :S))
     Oceananigans.restore_prognostic_state!(simulation, state)
-    simulation.model.clock.time = zero(simulation.model.clock.time)
-    simulation.model.clock.iteration = 0
-    simulation.Δt = 2minutes
+    if reset_clock
+        simulation.model.clock.time = zero(simulation.model.clock.time)
+        simulation.model.clock.iteration = 0
+        simulation.Δt = 2minutes
+    end
     return nothing
 end
 
-# Warm start from a checkpoint on another grid; donor = (n_lon, n_lat, n_depth, ocean_depth) of the run that wrote it.
+# Warm start from a checkpoint on another grid, described by the donor run's parameter file (see `read_parameters`).
 # T, u, v are interpolated; below a shallower donor's floor u = v = 0 and T continues the donor's thermocline exponentially.
-function regrid_pickup!(model, pickup, donor; planet_radius, T_night = 0.0)
-    
-    # Loads the grid and checks the halo
-    m = Oceananigans.OutputWriters.load_checkpoint_state(pickup).model
+function regrid_warm_start!(model, checkpoint, donor_parameters; planet_radius, T_night = 0.0)
+    donor = donor_grid(donor_parameters)
+    m = Oceananigans.OutputWriters.load_checkpoint_state(checkpoint).model
     saved = size(parent(m.tracers.T.data))
-    halo = (saved .- (donor.n_lon, donor.n_lat, donor.n_depth)) .÷ 2
-    all(halo .> 0) || error("pickup_grid $(donor) doesn't match the checkpoint (T is $(saved) with halos)")
+    halo = something(donor.halo, (saved .- (donor.n_lon, donor.n_lat, donor.n_depth)) .÷ 2)    # older parameter files have no halo
+    all(halo .> 0) || error("the donor grid $(donor) doesn't match the checkpoint (T is $(saved) with halos)")
 
-    # Loads the donor grid and new grid
-    src = ocean_grid(CPU(); donor.n_lon, donor.n_lat, donor.n_depth, donor.ocean_depth, planet_radius, halo)
+    src = ocean_grid(CPU(); donor.n_lon, donor.n_lat, donor.n_depth, donor.ocean_depth, planet_radius, halo,
+                     float_type = donor.float_type, r = donor.vertical_stretching, max_lat = donor.max_lat)
     dst = on_architecture(CPU(), model.grid)
 
     T_src, u_src, v_src = CenterField(src), XFaceField(src), YFaceField(src)
     for (f, saved, name) in ((T_src, m.tracers.T, :T), (u_src, m.velocities.u, :u), (v_src, m.velocities.v, :v))
         data = Array(parent(saved.data))
-        size(data) == size(parent(f)) || error("pickup_grid $(donor) doesn't match the checkpoint ($(name) is $(size(data)) with halos, expected $(size(parent(f))))")
+        size(data) == size(parent(f)) || error("the donor grid $(donor) doesn't match the checkpoint ($(name) is $(size(data)) with halos, expected $(size(parent(f))))")
         copyto!(parent(f), data)
         fill_halo_regions!(f)
     end
@@ -229,6 +238,56 @@ function thermocline_e_folding(T, grid, H, T_night)
 end
 
 #####
+##### Parameter files
+#####
+
+parameter_file(name) = joinpath(directory, "$(name)_parameters.toml")
+
+# Every input of a run, written at its start; times in seconds, other quantities SI; `nothing` is written as "nothing"
+function write_parameters(name, sections)
+    toml_value(x) = isnothing(x) ? "nothing" : x isa Union{Type, Function} ? string(x) : x isa Tuple ? collect(toml_value.(x)) : x
+    data =Dict{String, Any}(String(k) => Dict{String, Any}(String(n) => toml_value(v) for (n, v) in pairs(nt)) for (k, nt) in pairs(sections))
+    data["run"] = Dict("name" => name)
+    mkpath(directory)
+    open(io -> TOML.print(io, data; sorted = true), parameter_file(name), "w")
+    return nothing
+end
+
+function read_parameters(name)
+    path = parameter_file(name)
+    isfile(path) || error("no parameter file $(path). For a run that predates parameter files, write one with a [grid] section: " *
+                          "n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type")
+    return TOML.parsefile(path)
+end
+
+# Add an entry to a run's parameter file each time it is restarted
+function record_restart!(name, entry)
+    data = read_parameters(name)
+    push!(get!(data, "restarts", Any[]), Dict{String, Any}(String(k) => string(v) for (k, v) in pairs(entry)))
+    open(io -> TOML.print(io, data; sorted = true), parameter_file(name), "w")
+    return nothing
+end
+
+# Latest checkpoint <name>_iteration<N>.jld2 of a run
+function latest_checkpoint(name)
+    dir = joinpath(directory, "checkpoints")
+    matches = isdir(dir) ? filter(!isnothing, [match(Regex("^\\Q$(name)\\E_iteration(\\d+)\\.jld2\$"), f) for f in readdir(dir)]) : []
+    isempty(matches) && error("no checkpoint of $(name) in $(dir)")
+    return joinpath(dir, argmax(m -> parse(Int, m[1]), matches).match)
+end
+
+# The donor's grid from its parameters, with defaults for keys older runs didn't vary
+function donor_grid(p)
+    g = p["grid"]
+    float_types = Dict("Float32" => Float32, "Float64" => Float64)
+    return (n_lon = g["n_lon"], n_lat = g["n_lat"], n_depth = g["n_depth"], ocean_depth = Float64(g["ocean_depth"]),
+            max_lat = get(g, "max_lat", 80), vertical_stretching = get(g, "vertical_stretching", 1.2),
+            float_type = float_types[get(g, "float_type", "Float32")], halo = haskey(g, "halo") ? Tuple(g["halo"]) : nothing)
+end
+
+same_grid(a, b) = all(getfield(a, k) == getfield(b, k) for k in (:n_lon, :n_lat, :n_depth, :ocean_depth, :max_lat, :vertical_stretching, :float_type))
+
+#####
 ##### Diagnostics and output
 #####
 
@@ -270,7 +329,8 @@ function progress_callback(model, T_drift_tol, T_drift_window)
     return progress
 end
 
-function add_output_writers!(simulation, name; output_interval, zonal_mean_interval, checkpoint_interval, global_attributes = Dict())
+# append = true continues a restarted run's existing files
+function add_output_writers!(simulation, name; output_interval, snapshot_interval, checkpoint_interval, global_attributes = Dict(), append = false)
     model = simulation.model
     ocean_dir = joinpath(directory)
     mkpath(ocean_dir)
@@ -278,13 +338,17 @@ function add_output_writers!(simulation, name; output_interval, zonal_mean_inter
 
     if !isnothing(output_interval)
         simulation.output_writers[:full_3d] = NetCDFWriter(model, fields; filename = joinpath(ocean_dir, "$(name).nc"),
-                                                           schedule = TimeInterval(output_interval), overwrite_existing = true, global_attributes)
+                                                           schedule = TimeInterval(output_interval), overwrite_existing = !append, global_attributes)
     end
 
-    if !isnothing(zonal_mean_interval)
-        zonal = map(f -> Field(Average(f, dims = 1)), fields)
-        simulation.output_writers[:zonal_mean] = NetCDFWriter(model, zonal; filename = joinpath(ocean_dir, "$(name)_zonal.nc"),
-                                                              schedule = TimeInterval(zonal_mean_interval), overwrite_existing = true, global_attributes)
+    if !isnothing(snapshot_interval)
+        Nz = size(model.grid, 3)
+        section = map(f -> Field(Average(f, dims = 1)), fields)       # zonal mean (lat × z)
+        surface = map(f -> Field(f; indices = (:, :, Nz)), fields)    # top cell (lat × lon); w on the top cell's lower face
+        for (key, outputs) in ((:section, section), (:surface, surface))
+            simulation.output_writers[key] = NetCDFWriter(model, outputs; filename = joinpath(ocean_dir, "$(name)_$(key).nc"),
+                                                          schedule = TimeInterval(snapshot_interval), overwrite_existing = !append, global_attributes)
+        end
     end
 
     if !isnothing(checkpoint_interval)
@@ -314,10 +378,13 @@ end
     ocean_simulation(name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time; kwargs...)
 
 Tidally locked ocean forced by relaxing SST toward a day-night equilibrium (T_day at the substellar point, T_night on the
-nightside). `rotational_period` is in Earth days (0 for no rotation). Output goes to `\$EXO_OCEAN_OUTPUT/ocean/` (default `output/ocean/`).
+nightside). `rotational_period` is in Earth days (0 for no rotation). Output goes to `\$EXO_OCEAN_OUTPUT/` (default `output/`), including
+`<name>_parameters.toml` with every input of the run.
 
 Keywords:
-- `n_lat`, `n_lon`, `n_depth`, `use_GPU`: grid and architecture.
+- `resolution`: grid spacing in degrees, either one number or `(Δlon, Δlat)`; it must divide 360° and 2`max_lat` into whole cells.
+- `max_lat`: the grid spans latitudes ±`max_lat` (< 90), with walls there.
+- `n_depth`, `use_GPU`: number of vertical levels and architecture.
 - `vertical_stretching`: thickness ratio of adjacent vertical cells (√1.2 with 2× `n_depth` halves every default cell).
 - `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
 - `κ_horizontal`: horizontal horizontal tracer diffusivity (0 for none).
@@ -329,22 +396,41 @@ Keywords:
   [Fe/H]; default the nearby M-dwarf mean) and `emulator_device` (`"cpu"`/`"cuda"`) are passed through; `wind_stress_scale` multiplies the stress.
 - `salinity`: carry a passive salinity tracer initialised to this value (`nothing`: temperature only).
 - `cfl`, `max_Δt`: advective CFL target and timestep cap (inertial stability).
-- `pickup`: checkpoint to warm-start from; `pickup_grid = (; n_lon, n_lat, n_depth, ocean_depth)` if it was written on another grid.
+- `restart`: name of a run to continue from its latest checkpoint for a further `simulation_time` (`simulation_name` must be the same).
+  The grid comes from its parameter file (grid keywords and `ocean_depth` are ignored); the clock carries on and output is appended
+  to its existing files. Other settings come from this call, so pass the same ones to continue the run unchanged.
+- `warm_start`: name of a run whose latest checkpoint starts this new run (clock at 0, new output files). Its parameter file gives
+  the donor grid: on the same grid the state is copied exactly, otherwise T, u, v are interpolated onto this run's grid.
 - `T_drift_tol`, `T_drift_window`: stop when the trend of volume-mean T over the window falls below this (°C/yr).
-- `output_interval`, `zonal_mean_interval`, `checkpoint_interval`: model time between 3D snapshots, zonal means and checkpoints (`nothing` for none).
+- `output_interval`, `snapshot_interval`, `checkpoint_interval`: model time between 3D snapshots, `_section` (zonal-mean lat × z) and
+  `_surface` (top-cell lat × lon) snapshots, and checkpoints (`nothing` for none).
 """
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
-                          n_lat = 160, n_lon = 360, n_depth = 20, use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
+                          resolution = 1.0, max_lat = 80, n_depth = 20,
+                          use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
                           κ_horizontal = 1e3, ν_vertical = 1e-4, κ_vertical = 1e-4,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, surface_pressure = nothing, emulator_gcm = "exocam", emulator_feh = nothing,
                           emulator_device = nothing, wind_stress_scale = 1.0,
-                          cfl = 0.2, max_Δt = default_max_Δt(rotational_period),
-                          pickup = nothing, pickup_grid = nothing,
+                          cfl = 0.2, max_Δt = nothing,
+                          restart = nothing, warm_start = nothing,
                           T_drift_tol = nothing, T_drift_window = 10 * 365days,
-                          output_interval = 5 * 365days, zonal_mean_interval = nothing, checkpoint_interval = nothing)
+                          output_interval = 5 * 365days, snapshot_interval = 36.5days, checkpoint_interval = nothing)
 
     @info "Setting up simulation $(simulation_name)..."
+    isnothing(restart) || isnothing(warm_start) || error("pass either restart or warm_start, not both")
+    isnothing(restart) || restart == simulation_name || error("restart continues the run named $(restart), so simulation_name must be the same")
+    isnothing(warm_start) || warm_start != simulation_name || error("a warm start writes a new run, so simulation_name must differ from $(warm_start)")
+    if isnothing(restart)
+        0 < max_lat < 90 || error("max_lat must be between 0 and 90 (the grid's walls are at ±max_lat), got $(max_lat)")
+        Δlon, Δlat = resolution isa Tuple ? resolution : (resolution, resolution)
+        n_lon, n_lat = grid_cells(360, Δlon, "longitude"), grid_cells(2max_lat, Δlat, "latitude")
+    else
+        g = donor_grid(read_parameters(restart))
+        (; n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type) = g
+        resolution = (360 / n_lon, 2max_lat / n_lat)
+    end
+    max_Δt = something(max_Δt, default_max_Δt(rotational_period, max_lat))
     wind_file = nothing
     if emulator_wind  # solve before the grid exists, so the Python GPU job has released its memory
         isnothing(surface_pressure) && error("emulator_wind = true needs surface_pressure (bar)")
@@ -357,7 +443,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     tracers_adv = WENO(order = 5)
     closure = ocean_closure(; κ_horizontal, ν_vertical, κ_vertical)
     halo = required_halo(momentum, tracers_adv, closure)
-    grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching)
+    grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching, max_lat)
 
     rotation_rate = rotational_period == 0 ? 0 : omega_Earth / rotational_period
     eos = LinearEquationOfState(thermal_expansion = 2e-4, haline_contraction = 0.0)
@@ -365,7 +451,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
 
     wind_stress = isnothing(wind_file) ? nothing : emulator_wind_stress(wind_file, grid; P_rot = rotational_period, scale = wind_stress_scale)
     u_bcs, v_bcs = velocity_boundary_conditions(wind_field, wind_stress)
-    relaxation = (; T_day, T_night, Q2=Q_surface)
+    relaxation = (; T_day, T_night, W = Q_surface / (rho_seawater * cp_seawater))
     T_bcs = FieldBoundaryConditions(top = FluxBoundaryCondition(surface_relaxation, discrete_form = true, parameters = relaxation))
 
     model = HydrostaticFreeSurfaceModel(grid;
@@ -378,24 +464,49 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                                         free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7, fixed_Δt = max_Δt),
                                         boundary_conditions = (; u = u_bcs, v = v_bcs, T = T_bcs))
 
-    if isnothing(pickup)
+    donor_parameters = isnothing(warm_start) ? nothing : read_parameters(warm_start)
+    this_grid = (; n_lon, n_lat, n_depth, ocean_depth = Float64(ocean_depth), max_lat, vertical_stretching, float_type)
+    regrid = !isnothing(warm_start) && !same_grid(donor_grid(donor_parameters), this_grid)
+    if regrid
+        @info "Warm-starting from $(latest_checkpoint(warm_start)), regridded from $(donor_grid(donor_parameters))"
+        regrid_warm_start!(model, latest_checkpoint(warm_start), donor_parameters; planet_radius, T_night)
+    elseif isnothing(restart) && isnothing(warm_start)
         set!(model, T = T_night)
-    elseif !isnothing(pickup_grid)
-        @info "Warm-starting from $(pickup), regridded from $(pickup_grid)"
-        regrid_pickup!(model, pickup, pickup_grid; planet_radius, T_night)
     end
     isnothing(salinity) || set!(model, S = salinity)
 
     simulation = Simulation(model, Δt = 2minutes, stop_time = simulation_time)
-    if !isnothing(pickup) && isnothing(pickup_grid)
-        @info "Warm-starting from $(pickup)"
-        restore_checkpoint!(simulation, pickup; drop_salinity = isnothing(salinity))
+    if !isnothing(warm_start) && !regrid
+        @info "Warm-starting from $(latest_checkpoint(warm_start)) on the same grid"
+        restore_checkpoint!(simulation, latest_checkpoint(warm_start); drop_salinity = isnothing(salinity), reset_clock = true)
+    end
+
+    if isnothing(restart)
+        write_parameters(simulation_name, (
+            planet = (; rotational_period, ocean_depth, planet_radius, T_day, T_night),
+            grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
+                    z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
+            physics = (; κ_horizontal, ν_vertical, κ_vertical, heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity,
+                       wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure, emulator_gcm,
+                       emulator_feh, wind_file, wind_stress_scale),
+            time = (; simulation_time, cfl, max_Δt, T_drift_tol, T_drift_window, output_interval, snapshot_interval, checkpoint_interval),
+            warm_start = (; donor = warm_start, regridded = regrid,
+                          checkpoint = isnothing(warm_start) ? nothing : latest_checkpoint(warm_start))))
     end
 
     simulation.callbacks[:progress] = Callback(progress_callback(model, T_drift_tol, T_drift_window), IterationInterval(100))
     simulation.callbacks[:wizard] = Callback(TimeStepWizard(; cfl, max_change = 1.05, max_Δt), IterationInterval(10))
     global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale)
-    add_output_writers!(simulation, simulation_name; output_interval, zonal_mean_interval, checkpoint_interval, global_attributes)
+    add_output_writers!(simulation, simulation_name; output_interval, snapshot_interval, checkpoint_interval, global_attributes,
+                        append = !isnothing(restart))
+
+    if !isnothing(restart)    # after the writers exist, so their schedules are restored too
+        checkpoint = latest_checkpoint(restart)
+        restore_checkpoint!(simulation, checkpoint; drop_salinity = isnothing(salinity), reset_clock = false)
+        simulation.stop_time = simulation.model.clock.time + simulation_time
+        @info "Restarting from $(checkpoint) at $(prettytime(simulation.model.clock.time)) for a further $(prettytime(simulation_time))"
+        record_restart!(simulation_name, (; checkpoint, from_time = simulation.model.clock.time, simulation_time))
+    end
 
     @info "Simulation setup complete. Starting the run..."
     run!(simulation, checkpoint_at_end = !isnothing(checkpoint_interval))

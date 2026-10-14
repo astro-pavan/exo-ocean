@@ -162,7 +162,7 @@ function run_case(c, _ = nothing)
                                  pickup, pickup_grid,
                                  T_drift_tol = isnothing(c.drift) ? nothing : c.drift.tol,
                                  T_drift_window = isnothing(c.drift) ? 10 * 365days : c.drift.window * 365days,
-                                 output_interval = duration, zonal_mean_interval = min(36.5days, duration / 10),
+                                 output_interval = duration, snapshot_interval = min(36.5days, duration / 10),
                                  checkpoint_interval = min(10 * 365days, duration))
                 nan[] ? "nan" : "ok"
             catch err

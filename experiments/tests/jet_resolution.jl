@@ -26,5 +26,5 @@ ocean_simulation("jetres_$(scheme)_$(res)deg_D200", 10, 200meters, R_Earth, 30.0
                  use_GPU = get(ENV, "JETRES_CPU", "0") != "1",
                  kw..., max_Δt,
                  output_interval = duration,                       # 3D snapshots at the start and the end only
-                 zonal_mean_interval = min(36.5days, duration / 10),
+                 snapshot_interval = min(36.5days, duration / 10),
                  checkpoint_interval = duration)                   # final state, for extending a run later

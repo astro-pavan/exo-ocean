@@ -84,7 +84,7 @@ kwargs = (n_lon = round(Int, 360 / res), n_lat = round(Int, 160 / res), n_depth,
           pickup, pickup_grid,
           T_drift_tol = drift_tol, T_drift_window = drift_window,
           output_interval = "--no-3d" in flags ? nothing : 10 * 365days,
-          zonal_mean_interval = 73days, checkpoint_interval = 10 * 365days)
+          snapshot_interval = 73days, checkpoint_interval = 10 * 365days)
 haskey(opts, "--max-dt-hours") && (kwargs = merge(kwargs, (; max_Δt = opt("--max-dt-hours", 0.0) * hours)))
 
 @info "Deep-equilibrium run $(name): depth $(depth) m, $(n_depth) levels, $(res)°, P = $(P) d, ΔT = $(dT) K, " *

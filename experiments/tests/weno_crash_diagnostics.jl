@@ -140,7 +140,7 @@ function diagnose(c, out_dir)
                                  n_lon = round(Int, 360 / c.res), n_lat = round(Int, 160 / c.res), n_depth = levels_for(200),
                                  use_GPU = c.gpu, float_type = c.FT, momentum_advection = :weno5, τ_biharmonic = c.τ, κ_horizontal = 1e3,
                                  max_Δt = min(3hours * c.res, default_max_Δt(c.τ, c.P), default_max_Δt(nothing, c.P)),
-                                 output_interval = nothing, zonal_mean_interval = nothing, checkpoint_interval = nothing)
+                                 output_interval = nothing, snapshot_interval = nothing, checkpoint_interval = nothing)
             catch err
                 @error "Run failed" exception = (err, catch_backtrace())
             end

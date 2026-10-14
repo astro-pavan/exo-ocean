@@ -431,6 +431,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         resolution = (360 / n_lon, 2max_lat / n_lat)
     end
     max_Δt = something(max_Δt, default_max_Δt(rotational_period, max_lat))
+
+    # Sets up wind
     wind_file = nothing
     if emulator_wind  # solve before the grid exists, so the Python GPU job has released its memory
         isnothing(surface_pressure) && error("emulator_wind = true needs surface_pressure (bar)")
@@ -438,6 +440,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         rotational_period > 0 || error("emulator_wind needs a rotating, tidally locked planet (rotational_period > 0)")
         wind_file = emulator_wind_file(rotational_period, T_day, T_night, surface_pressure; gcm = emulator_gcm, feh = emulator_feh, device = emulator_device)
     end
+
+    # Sets up model settings
     arch = select_architecture(use_GPU)
     momentum = WENOVectorInvariant(order = 5)
     tracers_adv = WENO(order = 5)
@@ -462,8 +466,10 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                                         tracers = isnothing(salinity) ? (:T,) : (:T, :S),
                                         closure,
                                         free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7, fixed_Δt = max_Δt),
-                                        boundary_conditions = (; u = u_bcs, v = v_bcs, T = T_bcs))
+                                        boundary_conditions = (; u = u_bcs, v = v_bcs, T = T_bcs)
+                                        )
 
+    # Warm starts the model if a snapshot is provided    
     donor_parameters = isnothing(warm_start) ? nothing : read_parameters(warm_start)
     this_grid = (; n_lon, n_lat, n_depth, ocean_depth = Float64(ocean_depth), max_lat, vertical_stretching, float_type)
     regrid = !isnothing(warm_start) && !same_grid(donor_grid(donor_parameters), this_grid)
@@ -473,9 +479,11 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     elseif isnothing(restart) && isnothing(warm_start)
         set!(model, T = T_night)
     end
+
     isnothing(salinity) || set!(model, S = salinity)
 
     simulation = Simulation(model, Δt = 2minutes, stop_time = simulation_time)
+    
     if !isnothing(warm_start) && !regrid
         @info "Warm-starting from $(latest_checkpoint(warm_start)) on the same grid"
         restore_checkpoint!(simulation, latest_checkpoint(warm_start); drop_salinity = isnothing(salinity), reset_clock = true)

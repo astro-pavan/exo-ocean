@@ -8,6 +8,7 @@ const rho_seawater = 1026 # kg/m^3
 const cp_seawater = 3994.0 # J/(kg·K)
 const C_Bottom_Drag = 1e-2
 const C_D_wind = 0.002
+const Q_surface = 30 # W/m^2/K - Haney (1971)
 
 # Atmosphere
 const rho_air = 1.2 # kg/m^3

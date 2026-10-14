@@ -134,7 +134,7 @@ function diagnose(c, out_dir)
     nan, t0 = Ref(false), time()
     iterations_run = Ref(0)
     open(joinpath(out_dir, "$(c.name).log"), "w") do io
-        with_logger(RunLogger(io, c.name, nan)) do
+        with_logger(RunLogger(io, c.name, nan, Ref(false))) do
             try
                 ocean_simulation(c.name, c.P, 200.0, R_Earth, 30.0, 0.0, 10 * 365days;
                                  n_lon = round(Int, 360 / c.res), n_lat = round(Int, 160 / c.res), n_depth = levels_for(200),

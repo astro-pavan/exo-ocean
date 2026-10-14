@@ -116,6 +116,7 @@ struct RunLogger <: AbstractLogger
     io::IO
     name::String
     nan::Base.RefValue{Bool}
+    finished::Base.RefValue{Bool}
 end
 Logging.min_enabled_level(::RunLogger) = Logging.Info
 Logging.shouldlog(::RunLogger, args...) = true
@@ -123,6 +124,7 @@ Logging.catch_exceptions(::RunLogger) = true
 function Logging.handle_message(l::RunLogger, level, message, _module, group, id, file, line; kwargs...)
     msg = string(message)
     occursin("NaN found", msg) && (l.nan[] = true)
+    occursin(r"exceeds stop time|Deep equilibrium", msg) && (l.finished[] = true)
     for (k, v) in kwargs
         msg *= k == :exception ? "\n" * sprint(showerror, v...) : "\n$(k) = $(v)"
     end
@@ -139,9 +141,9 @@ function run_case(c, _ = nothing)
     ocean_dir = joinpath(directory, "ocean")
     mkpath(ocean_dir)
     duration = c.years * 365days
-    nan, t0 = Ref(false), time()
-    status = open(joinpath(ocean_dir, "$(c.name).log"), "w") do io
-        with_logger(RunLogger(io, c.name, nan)) do
+    nan, finished, t0 = Ref(false), Ref(false), time()
+    status = try open(joinpath(ocean_dir, "$(c.name).log"), "w") do io
+        with_logger(RunLogger(io, c.name, nan, finished)) do
             try
                 pickup, pickup_grid = nothing, nothing
                 if !isnothing(c.pickup)
@@ -165,9 +167,13 @@ function run_case(c, _ = nothing)
                 nan[] ? "nan" : "ok"
             catch err
                 @error "Run failed" exception = (err, catch_backtrace())
-                "error"
+                finished[] ? "ok" : "error"    # e.g. only the final checkpoint failed to write; the output is complete
             end
         end
+    end
+    catch err
+        println("[$(c.name)] could not run: ", sprint(showerror, err))
+        "error"
     end
     # The checkpointer also saves the initial state; keep only the latest
     dir = joinpath(ocean_dir, "checkpoints")
@@ -207,7 +213,12 @@ function run_all(todo, _, summary_path)
             end
             c = popat!(queue, i)
             state[c.name] = "running"
-            r = remotecall_fetch(run_case, w, c)
+            r = try
+                remotecall_fetch(run_case, w, c)
+            catch err
+                println("[$(c.name)] worker error: ", sprint(showerror, err))
+                (; c.name, status = "error", minutes = 0.0)
+            end
             state[c.name] = r.status
             record(r.name, r.status, r.minutes)
         end

@@ -228,3 +228,4 @@ __marimo__/
 # Machine-specific files written by setup.sh
 env.sh
 LocalPreferences.toml
+logs/

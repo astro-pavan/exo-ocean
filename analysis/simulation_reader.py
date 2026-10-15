@@ -111,6 +111,7 @@ class SimulationData:
         """
         try:
             ds = xr.open_dataset(filename, decode_times=False)
+            ds = ds.drop_duplicates('time', keep='last')    # a resumed run rewrites the snapshots made after its last checkpoint
         except FileNotFoundError:
             raise FileNotFoundError(f"Could not find '{filename}'.")
 

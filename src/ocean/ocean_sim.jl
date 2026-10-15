@@ -287,6 +287,16 @@ function latest_checkpoint(name)
     return joinpath(dir, argmax(m -> parse(Int, m[1]), matches).match)
 end
 
+has_checkpoint(name) = isdir(joinpath(directory, "checkpoints")) &&
+                       any(f -> occursin(Regex("^\\Q$(name)\\E_iteration\\d+\\.jld2\$"), f), readdir(joinpath(directory, "checkpoints")))
+
+# Model time (s) a run is meant to reach: the end of its last restart, or else its original simulation_time
+function planned_end(p)
+    restarts = get(p, "restarts", Any[])
+    isempty(restarts) && return Float64(p["time"]["simulation_time"])
+    return parse(Float64, restarts[end]["from_time"]) + parse(Float64, restarts[end]["simulation_time"])
+end
+
 # The donor's grid from its parameters, with defaults for keys older runs didn't vary
 function donor_grid(p)
     g = p["grid"]
@@ -439,6 +449,8 @@ Keywords:
 - `restart`: name of a run to continue from its latest checkpoint for a further `simulation_time` (`simulation_name` must be the same).
   The grid comes from its parameter file (grid keywords and `ocean_depth` are ignored); the clock carries on and output is appended
   to its existing files. Other settings come from this call, so pass the same ones to continue the run unchanged.
+- `resume`: with `restart`, run on to the run's planned end (see `planned_end`) instead of a further `simulation_time`, which is ignored;
+  used to pick up a run cut off by a job's wall time.
 - `warm_start`: name of a run whose latest checkpoint starts this new run (clock at 0, new output files). Its parameter file gives
   the donor grid: on the same grid the state is copied exactly, otherwise T, u, v are interpolated onto this run's grid.
 - `equilibrium_tol`, `equilibrium_window`: stop at deep equilibrium, when the Gregory-style projected remaining change of volume-mean T
@@ -453,13 +465,14 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0,
                           cfl = 0.2, max_Δt = nothing,
-                          restart = nothing, warm_start = nothing,
+                          restart = nothing, resume = false, warm_start = nothing,
                           equilibrium_tol = nothing, equilibrium_window = 10 * 365days,
                           output_interval = 5 * 365days, snapshot_interval = 36.5days, checkpoint_interval = nothing)
 
     @info "Setting up simulation $(simulation_name)..."
     isnothing(restart) || isnothing(warm_start) || error("pass either restart or warm_start, not both")
     isnothing(restart) || restart == simulation_name || error("restart continues the run named $(restart), so simulation_name must be the same")
+    !resume || !isnothing(restart) || error("resume continues a run, so it needs restart")
     isnothing(warm_start) || warm_start != simulation_name || error("a warm start writes a new run, so simulation_name must differ from $(warm_start)")
     if isnothing(restart)
         0 < max_lat < 90 || error("max_lat must be between 0 and 90 (the grid's walls are at ±max_lat), got $(max_lat)")
@@ -552,8 +565,13 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     if !isnothing(restart)    # after the writers exist, so their schedules are restored too
         checkpoint = latest_checkpoint(restart)
         restore_checkpoint!(simulation, checkpoint; drop_salinity = isnothing(salinity), reset_clock = false)
-        simulation.stop_time = simulation.model.clock.time + simulation_time
-        @info "Restarting from $(checkpoint) at $(prettytime(simulation.model.clock.time)) for a further $(prettytime(simulation_time))"
+        t₀ = simulation.model.clock.time
+        if resume
+            simulation_time = planned_end(read_parameters(restart)) - t₀
+            simulation_time > 0 || (record_finished!(simulation_name, Float64(t₀), "stop_time"); return nothing)    # cut off after its last checkpoint
+        end
+        simulation.stop_time = t₀ + simulation_time
+        @info "Restarting from $(checkpoint) at $(prettytime(t₀)) for a further $(prettytime(simulation_time))"
         record_restart!(simulation_name, (; checkpoint, from_time = simulation.model.clock.time, simulation_time))
     end
 

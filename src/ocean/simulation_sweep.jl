@@ -8,6 +8,7 @@ const NOT_KEYWORDS = (RUN_FIELDS..., :simulation_time, :planet_radius)
 # Default two-stage run: a 2° spin-up to deep equilibrium (capped at 300 years), then 10 years on the run's own grid with no stopping test
 const SPIN_UP = (resolution = 2.0, simulation_time = 300 * 365days, checkpoint_interval = 10 * 365days)
 const MAIN_TIME = 10 * 365days
+const MAIN_CHECKPOINT = 365days    # so a run cut off by the wall time loses at most a year when resumed
 const EQUILIBRIUM_TOL = 0.002    # default spin-up equilibrium_tol as a fraction of T_day − T_night
 
 """
@@ -21,8 +22,9 @@ Run one `ocean_simulation` from `params`, a NamedTuple with `name`, `rotational_
   T_day − T_night unless given) or after 300 years; `nothing` runs the main stage alone.
 - `warm_start`: name of an existing run to start from (the low-res stage if there is one, otherwise the main run).
 
-A stage whose parameter file marks it finished is skipped, so rerunning picks up where a sweep stopped; an unfinished one reruns
-from the start.
+A stage whose parameter file marks it finished is skipped, and an unfinished one with a checkpoint is resumed from it to its planned
+end (it must have the same grid), so rerunning picks up where a sweep stopped; one with no checkpoint reruns from the start. The main
+stage checkpoints every year unless `checkpoint_interval` is given.
 """
 function simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_up_name = "$(params.name)_spinup")
     missing_fields = filter(k -> !haskey(params, k), RUN_FIELDS)
@@ -31,19 +33,32 @@ function simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_
 
     function launch(name, p, from)
         is_finished(name) && return @info("Skipping $(name): already finished")
+        resume = has_checkpoint(name) && isfile(parameter_file(name))
+        resume && (check_same_grid(name, p); @info("Resuming $(name) from its latest checkpoint"))
         ocean_simulation(name, p.rotational_period, p.ocean_depth, planet_radius, p.T_day, p.T_night, get(p, :simulation_time, MAIN_TIME);
-                         Base.structdiff(p, NamedTuple{NOT_KEYWORDS})..., warm_start = from)
+                         Base.structdiff(p, NamedTuple{NOT_KEYWORDS})..., (resume ? (; restart = name, resume) : (; warm_start = from))...)
     end
 
+    main = merge((; checkpoint_interval = MAIN_CHECKPOINT), params)
     if isnothing(low_res_start)
-        launch(params.name, params, warm_start)
+        launch(params.name, main, warm_start)
     else
         spin_up = merge((; equilibrium_tol = EQUILIBRIUM_TOL * (params.T_day - params.T_night)), params, low_res_start)
         spin_up = merge(spin_up, (; checkpoint_interval = something(get(spin_up, :checkpoint_interval, nothing), spin_up.simulation_time)))    # the main run needs its checkpoint
         launch(spin_up_name, spin_up, warm_start)
-        launch(params.name, params, spin_up_name)
+        launch(params.name, main, spin_up_name)
     end
     return nothing
+end
+
+# A resumed run takes its grid from its parameter file, so refuse one whose grid settings in `p` have changed since it started
+function check_same_grid(name, p)
+    g = read_parameters(name)["grid"]
+    for k in (:resolution, :n_depth, :ocean_depth, :max_lat, :vertical_stretching, :float_type)
+        haskey(p, k) || continue
+        want = p[k] isa Tuple ? collect(p[k]) : p[k] isa Type ? string(p[k]) : p[k]
+        g[String(k)] == want || error("can't resume $(name): $(k) is $(g[String(k)]) in its parameter file but $(p[k]) now; delete its checkpoint to rerun it")
+    end
 end
 
 # How a swept value appears in a run name, as (before, after) the value: P10, nu1e-5, 0.5deg, wind3bar

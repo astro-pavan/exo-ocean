@@ -1,5 +1,6 @@
 include("ocean_sim.jl")
 using Oceananigans.Units
+using Printf
 
 const RUN_FIELDS = (:name, :rotational_period, :ocean_depth, :T_day, :T_night)
 const NOT_KEYWORDS = (RUN_FIELDS..., :simulation_time, :planet_radius)
@@ -10,12 +11,12 @@ const MAIN_TIME = 10 * 365days
 const EQUILIBRIUM_TOL = 0.002    # default spin-up equilibrium_tol as a fraction of T_day − T_night
 
 """
-    simulation(params, low_res_start = SPIN_UP, warm_start = nothing)
+    simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_up_name = "<name>_spinup")
 
 Run one `ocean_simulation` from `params`, a NamedTuple with `name`, `rotational_period`, `ocean_depth`, `T_day`, `T_night`, optionally
 `simulation_time` (default 10 years) and `planet_radius` (default `R_Earth`), and any `ocean_simulation` keywords (e.g. `resolution`).
 
-- `low_res_start`: settings that override `params` for a first, coarse stage run as `<name>_lowres`; the main run then warm-starts
+- `low_res_start`: settings that override `params` for a first, coarse stage run as `spin_up_name`; the main run then warm-starts
   from it, regridded onto its own grid. By default a 2° spin-up stopped at deep equilibrium (`equilibrium_tol` = 0.2% of
   T_day − T_night unless given) or after 300 years; `nothing` runs the main stage alone.
 - `warm_start`: name of an existing run to start from (the low-res stage if there is one, otherwise the main run).
@@ -23,7 +24,7 @@ Run one `ocean_simulation` from `params`, a NamedTuple with `name`, `rotational_
 A stage whose parameter file marks it finished is skipped, so rerunning picks up where a sweep stopped; an unfinished one reruns
 from the start.
 """
-function simulation(params, low_res_start = SPIN_UP, warm_start = nothing)
+function simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_up_name = "$(params.name)_spinup")
     missing_fields = filter(k -> !haskey(params, k), RUN_FIELDS)
     isempty(missing_fields) || error("params is missing $(missing_fields)")
     planet_radius = get(params, :planet_radius, R_Earth)
@@ -39,35 +40,44 @@ function simulation(params, low_res_start = SPIN_UP, warm_start = nothing)
     else
         spin_up = merge((; equilibrium_tol = EQUILIBRIUM_TOL * (params.T_day - params.T_night)), params, low_res_start)
         spin_up = merge(spin_up, (; checkpoint_interval = something(get(spin_up, :checkpoint_interval, nothing), spin_up.simulation_time)))    # the main run needs its checkpoint
-        launch("$(params.name)_lowres", spin_up, warm_start)
-        launch(params.name, params, "$(params.name)_lowres")
+        launch(spin_up_name, spin_up, warm_start)
+        launch(params.name, params, spin_up_name)
     end
     return nothing
 end
 
+# How a swept value appears in a run name, as (before, after) the value: P10, nu1e-5, 0.5deg, wind3bar
+const NAME_TAGS = Dict(:rotational_period => ("P", ""), :T_day => ("Tday", ""), :T_night => ("Tnight", ""), :ocean_depth => ("D", "m"),
+                       :resolution => ("", "deg"), :n_depth => ("nz", ""), :ν_vertical => ("nu", ""), :κ_vertical => ("kv", ""),
+                       :κ_horizontal => ("kh", ""), :surface_pressure => ("wind", "bar"))
+compact(x::Real) = isinteger(x) ? string(Int(x)) : abs(x) < 0.01 ? replace(@sprintf("%.0e", x), "e-0" => "e-") : string(x)
+compact(x) = string(x)
+name_tag(key, value) = ((before, after) = get(NAME_TAGS, key, (String(key), "")); before * compact(value) * after)
+run_name(prefix, point) = join([prefix; [name_tag(k, v) for (k, v) in pairs(point)]], "_")
+
 """
-    sweep(base; low_res_start = SPIN_UP, warm_start = nothing, prefix = "sweep", name = nothing, swept...)
+    sweep(base; low_res_start = SPIN_UP, warm_start = nothing, prefix = "sweep", swept...)
 
 Run `simulation` for every combination of the swept values, e.g.
-`sweep((ocean_depth = 1kilometer, T_night = 0.0, resolution = 0.5); rotational_period = [3, 10, 30], T_day = [10, 30])`.
-`base` holds the fixed parameters; each run is named `<prefix>_<key><value>_...` unless `name(params)` is given. `warm_start` is a run
-name or a function `params -> run name`. A failed run is logged and the sweep continues; returns each run's name and status.
+`sweep((; ocean_depth = 1000.0, T_night = 0.0, T_day = 30.0); prefix = "test", rotational_period = [3, 10], resolution = [1.0, 0.5])`
+runs test_P3_1deg, test_P3_0.5deg, test_P10_1deg and test_P10_0.5deg. `base` holds the fixed parameters. Runs that differ only in
+`resolution` (or `simulation_time`) share one spin-up, named without them (here test_P3_spinup and test_P10_spinup), since the spin-up
+overrides both; give sweeps with different `base` settings different prefixes so they don't share spin-ups by mistake. `warm_start`
+is a run name or a function `params -> run name`. A failed run is logged and the sweep continues; returns each run's name and status.
 """
-function sweep(base; low_res_start = SPIN_UP, warm_start = nothing, prefix = "sweep", name = nothing, swept...)
-    keys_swept = Tuple(keys(swept))
+function sweep(base; low_res_start = SPIN_UP, warm_start = nothing, prefix = "sweep", swept...)
     statuses = Pair{String, String}[]
     for values in Iterators.product(Base.values(swept)...)
-        point = NamedTuple{keys_swept}(values)
-        params = merge(base, point)
-        run_name = isnothing(name) ? prefix * join("_$(k)$(v)" for (k, v) in pairs(point)) : name(params)
-        params = merge(params, (; name = run_name))
-        donor = warm_start isa Function ? warm_start(params) : warm_start
+        point = NamedTuple{Tuple(keys(swept))}(values)
+        name = run_name(prefix, point)
+        spin_up_name = run_name(prefix, Base.structdiff(point, NamedTuple{(:resolution, :simulation_time)})) * "_spinup"
+        params = merge(base, point, (; name))
         try
-            simulation(params, low_res_start, donor)
-            push!(statuses, run_name => "ok")
+            simulation(params, low_res_start, warm_start isa Function ? warm_start(params) : warm_start; spin_up_name)
+            push!(statuses, name => "ok")
         catch err
-            @error "Run $(run_name) failed" exception = (err, catch_backtrace())
-            push!(statuses, run_name => "error")
+            @error "Run $(name) failed" exception = (err, catch_backtrace())
+            push!(statuses, name => "error")
         end
     end
     foreach(s -> @info("$(s.first): $(s.second)"), statuses)

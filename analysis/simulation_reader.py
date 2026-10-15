@@ -1,6 +1,8 @@
 import xarray as xr
 import numpy as np
 
+import matplotlib.pyplot as plt
+
 
 def rebin(arr, factors):
     """
@@ -78,6 +80,25 @@ def _select_time(da, time_sel):
     if isinstance(time_sel, (int, np.integer)):
         return da.isel(time=time_sel)
     return da.isel(time=time_sel).mean(dim='time')
+
+
+def thermocline_depth(T, z, min_contrast=0.1):
+    """
+    Thermocline depth (m, positive down) of each column, the first moment of the warm anomaly over the coldest water:
+    D = ∫ ΔT (-z) dz / ∫ ΔT dz with ΔT = T(z) - min_z T, the pycnocline depth of Gnanadesikan (1999, Science 283, note 11)
+    written in temperature, which is equivalent here because the equation of state is linear in T with fixed salinity.
+    """
+    T = np.asarray(T, dtype=float)
+    z = np.asarray(z, dtype=float)
+    faces = np.zeros(len(z) + 1)    # cell faces from the centres, working down from the surface at z = 0
+    for k in range(len(z) - 1, -1, -1):
+        faces[k] = 2 * z[k] - faces[k + 1]
+    dz = np.diff(faces)[:, None, None]
+
+    anomaly = T - T.min(axis=0)
+    D = (anomaly * -z[:, None, None] * dz).sum(axis=0) / (anomaly * dz).sum(axis=0)
+    contrast = T.max(axis=0) - T.min(axis=0)
+    return np.where(contrast > min_contrast * contrast.max(), D, np.nan)
 
 
 class SimulationData:
@@ -261,3 +282,74 @@ class SimulationData:
             print(f'mslp:{self.mslp.shape}')
         if self.vor is not None:
             print(f'vor: {self.vor.shape}')
+
+    def thermocline_depth(self, min_contrast=0.1):
+        """Thermocline depth (m) on the (lat, lon) grid; see the module-level thermocline_depth."""
+        return thermocline_depth(self.T, self.z, min_contrast)
+
+    def jet_properties(self):
+
+        u_zonal_mean = np.average(self.u, axis=2)
+
+        u_jet_max = np.max(self.u)
+        u_jet_mean = np.max(u_zonal_mean)
+
+        print(f'Jet core speed {u_jet_mean:.3f} m/s')
+        print(f'Jet max speed {u_jet_max:.3f} m/s')
+
+        i_core_depth = np.unravel_index(np.argmax(u_zonal_mean), u_zonal_mean.shape)[0]
+        core_depth = self.z[i_core_depth]
+
+        u_profile_normalised = u_zonal_mean[i_core_depth, :] / u_jet_mean
+
+        # walk out from the core latitude to the first point below half maximum on each side, then interpolate linearly
+        i_core_lat = np.argmax(u_profile_normalised)
+        below = u_profile_normalised < 0.5
+        south = np.nonzero(below[:i_core_lat])[0]
+        north = np.nonzero(below[i_core_lat:])[0] + i_core_lat
+        lat_south = np.interp(0.5, u_profile_normalised[[south[-1], south[-1] + 1]], self.lat[[south[-1], south[-1] + 1]]) if len(south) else np.nan
+        lat_north = np.interp(0.5, u_profile_normalised[[north[0], north[0] - 1]], self.lat[[north[0], north[0] - 1]]) if len(north) else np.nan
+        print(f'Jet core {self.lat[i_core_lat]:.1f}°, half maximum at {lat_south:.1f}° and {lat_north:.1f}° (width {lat_north - lat_south:.1f}°)')
+
+        jet_width = lat_north - lat_south
+
+        # the same walk vertically at the core latitude; a jet above half maximum all the way up has its top at the surface
+        u_column_normalised = u_zonal_mean[:, i_core_lat] / u_jet_mean
+        below = u_column_normalised < 0.5
+        lower = np.nonzero(below[:i_core_depth])[0]
+        upper = np.nonzero(below[i_core_depth:])[0] + i_core_depth
+        z_bottom = np.interp(0.5, u_column_normalised[[lower[-1], lower[-1] + 1]], self.z[[lower[-1], lower[-1] + 1]]) if len(lower) else np.nan
+        z_top = np.interp(0.5, u_column_normalised[[upper[0], upper[0] - 1]], self.z[[upper[0], upper[0] - 1]]) if len(upper) else 0.0
+        jet_height = z_top - z_bottom
+        print(f'Jet core at {core_depth:.1f} m, half maximum at {z_bottom:.1f} m and {z_top:.1f} m (height {jet_height:.1f} m)')
+
+        return u_jet_mean, core_depth, jet_width, jet_height, u_jet_max
+
+        
+
+    def deep_circulation_properties(self):
+
+        thermocline = thermocline_depth(self.T, self.z)
+
+        # dT = self.T - self.T[0, :, :]
+        # above_thermocline = (dT > dT[-1, :, :] / (4 * np.e))
+        # print(above_thermocline.shape)
+        # i_thermocline = np.argmax(above_thermocline, axis=0)
+        # z_therm = self.z[i_thermocline] / 4
+
+        dlat = np.radians(abs(self.lat[1] - self.lat[0]))
+        lat_r = np.radians(self.lat)
+        area = (np.sin(lat_r + dlat / 2) - np.sin(lat_r - dlat / 2))[:, None] * np.ones_like(thermocline)    # cell area ∝ Δ(sin φ)
+        valid = ~np.isnan(thermocline)
+        D_mean = np.sum(np.where(valid, area * thermocline, 0)) / np.sum(area[valid])
+        equator = np.abs(self.lat) < abs(self.lat[1] - self.lat[0])    # the rows either side of the equator
+        D_equator = np.nanmean(thermocline[equator, :])
+        print(f'Thermocline depth: area-weighted mean {D_mean:.1f} m over {np.sum(area[valid]) / np.sum(area):.0%} of the area, '
+              f'equatorial mean {D_equator:.1f} m')
+
+        return D_mean, D_equator
+
+if __name__ == '__main__':
+
+    data = SimulationData('output/ocean/deepeq_P_10_dT_30.0_D_1.nc')
+    data.jet_properties()

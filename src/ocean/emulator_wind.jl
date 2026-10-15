@@ -60,12 +60,28 @@ function bilinear_periodic(f, lon, lat, λ, φ)
     return (1 - s) * (1 - t) * f[i0, j0] + s * (1 - t) * f[i1, j0] + (1 - s) * t * f[i0, j1] + s * t * f[i1, j1]
 end
 
-# Neutral 10 m drag coefficient of Large & Yeager (2004, NCAR TN-460; 2009, Clim. Dyn. 33, 341), with CORE's 0.5 m/s wind-speed floor.
+# Neutral 10 m drag coefficient of Large & Yeager (2004, NCAR TN-460, eq. 6a), with CORE's 0.5 m/s wind-speed floor.
 large_yeager_CD(U) = 2.7e-3 / max(U, 0.5) + 1.42e-4 + 7.64e-5 * max(U, 0.5)
 
-# Kinematic surface stress (τx, τy) / ρ₀ at u- and v-points for `ocean_simulation(...; wind_stress)`: τ = ρ_air C_D(|U|) |U| U from the
-# planet's lowest-level wind and near-surface air density, signed as wind_stress_u/v in ocean_sim.jl. Pass `P_rot` (days) to check the file;
-# `scale` multiplies the stress (e.g. 0.5 to bracket the 10 m vs lowest-level wind height bias).
+const EMULATOR_LOWEST_LEVEL = 0.925    # CLERO's lowest level sits at this fraction of the surface pressure (clero/climate_analysis/profiles.py)
+const VON_KARMAN = 0.4
+
+# Height (m) of the emulator's lowest level: hydrostatic with scale height H = P0 / (ρ_air g), ρ_air being the air density at that level's T
+lowest_level_height(P0_bar, ρa, g) = P0_bar * 1e5 / (ρa * g) * log(1 / EMULATOR_LOWEST_LEVEL)
+
+# Equivalent neutral 10 m wind speed from the speed W at height z: Large & Yeager (2004) eq. 9a with neutral stability (ψ_m = 0),
+# iterated because C_D depends on the 10 m speed
+function neutral_10m_speed(W, z)
+    U₁₀ = W
+    for _ in 1:5
+        U₁₀ = W / (1 + sqrt(large_yeager_CD(U₁₀)) / VON_KARMAN * log(z / 10))
+    end
+    return U₁₀
+end
+
+# Kinematic surface stress (τx, τy) / ρ₀ at u- and v-points for `ocean_simulation(...; wind_stress)`: τ = ρ_air C_D(U₁₀) U₁₀² along the
+# lowest-level wind U, with U₁₀ the equivalent neutral 10 m speed shifted down from the lowest level's height, signed as wind_stress_u/v in
+# ocean_sim.jl. Pass `P_rot` (days) to check the file; `scale` multiplies the stress.
 function emulator_wind_stress(path, grid; P_rot = nothing, scale = 1)
     lon, lat, u, v, ρa, attrs = NCDataset(path) do ds
         haskey(ds, "rho_air") && ndims(ds["u_0"]) == 2 || error("$(basename(path)) is not a single-planet wind file; regenerate it with src/climate/climate_emulator.py")
@@ -77,8 +93,11 @@ function emulator_wind_stress(path, grid; P_rot = nothing, scale = 1)
     function stress(λ, φ, component)
         U = bilinear_periodic(u, lon, lat, λ, φ)
         V = bilinear_periodic(v, lon, lat, λ, φ)
+        ρ = bilinear_periodic(ρa, lon, lat, λ, φ)
         W = sqrt(U^2 + V^2)
-        return -scale * bilinear_periodic(ρa, lon, lat, λ, φ) * large_yeager_CD(W) * W * (component == :x ? U : V) / rho_seawater
+        W > 0 || return zero(W)
+        U₁₀ = neutral_10m_speed(W, lowest_level_height(attrs["P0_bar"], ρ, attrs["gravity_m_s2"]))
+        return -scale * ρ * large_yeager_CD(U₁₀) * U₁₀^2 * (component == :x ? U : V) / W / rho_seawater
     end
 
     cpu_grid = on_architecture(CPU(), grid)
@@ -86,7 +105,8 @@ function emulator_wind_stress(path, grid; P_rot = nothing, scale = 1)
     τy = [stress(λ, φ, :y) for λ in λnodes(cpu_grid, Center()), φ in φnodes(cpu_grid, Face())]    # (Nx, Ny+1) at v-points
     @info "Emulator wind stress from $(basename(path)) (P_rot = $(attrs["P_rot_days"]) d, P0 = $(attrs["P0_bar"]) bar, " *
           "T_star = $(round(Int, attrs["T_star_K"])) K, F_star = $(round(Int, attrs["F_star_W_m2"])) W/m², CO2 = $(round(attrs["CO2"], sigdigits=3))): " *
-          "max |τ| = $(round(rho_seawater * maximum(hypot.(τx, τy[:, 1:end-1])), sigdigits=3)) N/m²"
+          "max |τ| = $(round(rho_seawater * maximum(hypot.(τx, τy[:, 1:end-1])), sigdigits=3)) N/m², from winds at " *
+          "$(round(Int, lowest_level_height(attrs["P0_bar"], mean(ρa), attrs["gravity_m_s2"]))) m reduced to 10 m"
 
     FT = eltype(grid)
     arch = architecture(grid)

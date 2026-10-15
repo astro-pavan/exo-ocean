@@ -230,11 +230,12 @@ def horizontal_circulation(sim: SimulationData, level=-1, style='stream', colour
 
 if __name__ == '__main__':
 
-    data = SimulationData('deepeq_P_10_dT_30.0_D_1.nc')
+    data = SimulationData('output/ocean/deepeq_P_10_dT_30.0_D_1.nc')
 
-    for style in ('stream', 'quiver'):
-        equatorial_section(data, style=style)
-        equatorial_section(data, style=style, polar=True, colour='w')
-        horizontal_circulation(data, style=style)
-        horizontal_circulation(data, style=style, projection='mollweide')
+    horizontal_circulation(data, style='quiver', projection='mollweide')
+    # for style in ('stream', 'quiver'):
+    #     equatorial_section(data, style=style)
+    #     equatorial_section(data, style=style, polar=True, colour='w')
+    #     horizontal_circulation(data, style=style)
+    #     horizontal_circulation(data, style=style, projection='mollweide')
     plt.show()

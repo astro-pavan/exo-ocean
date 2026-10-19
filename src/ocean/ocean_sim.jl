@@ -334,16 +334,18 @@ function projected_change(T, H)
     return (b < 0 ? mean(T) - mean(H) / b - T[end] : NaN), mean(H)
 end
 
-# Deep-equilibrium test over the last `window` of model time: stop once the projected remaining change of ⟨T⟩ is below `tol` (°C),
-# or, when only noise is left to fit, once the window-mean surface heat flux is below `flux_tol` (W/m²)
-function equilibrium_check(tol, window; flux_tol = 0.1)
+# Deep-equilibrium test over the last `window` of model time, once the first window (the fast surface adjustment, which steepens the
+# fit and hides the slow deep drift; Rugenstein et al. 2020, GRL 47, e2019GL083898) has passed: stop when both the projected remaining
+# change of ⟨T⟩ (if there is drift left to fit) and the change one more window at the window-mean flux would make are below `tol` (°C).
+# `heat_capacity` is ρ c_p × depth (J/m²/K), so the second test is H̄ window / heat_capacity < tol.
+function equilibrium_check(tol, window, heat_capacity)
     history = NTuple{3, Float64}[]
     function check!(sim, t, T̄, H)
         push!(history, (t, T̄, H))
         filter!(s -> t - s[1] <= window, history)
-        (length(history) >= 3 && t - history[1][1] >= 0.99 * window) || return NaN
+        (length(history) >= 3 && t >= 1.99 * window && t - history[1][1] >= 0.99 * window) || return NaN
         gap, H̄ = projected_change(getindex.(history, 2), getindex.(history, 3))
-        if isfinite(gap) ? abs(gap) < tol : abs(H̄) < flux_tol
+        if (!isfinite(gap) || abs(gap) < tol) && abs(H̄) * window / heat_capacity < tol
             @info "Deep equilibrium: projected remaining change of ⟨T⟩ $(round(gap, sigdigits=2)) °C (tolerance $(tol) °C), mean surface " *
                   "heat flux $(round(H̄, sigdigits=2)) W/m² over the last $(round(window / 365days, digits=1)) years. Stopping at $(prettytime(t))."
             sim.running = false
@@ -453,8 +455,8 @@ Keywords:
   used to pick up a run cut off by a job's wall time.
 - `warm_start`: name of a run whose latest checkpoint starts this new run (clock at 0, new output files). Its parameter file gives
   the donor grid: on the same grid the state is copied exactly, otherwise T, u, v are interpolated onto this run's grid.
-- `equilibrium_tol`, `equilibrium_window`: stop at deep equilibrium, when the Gregory-style projected remaining change of volume-mean T
-  over the window is below `equilibrium_tol` (°C); see `equilibrium_check`. `nothing` runs for the full `simulation_time`.
+- `equilibrium_tol`, `equilibrium_window`: stop at deep equilibrium, when, after the first window, both the Gregory-style projected
+  remaining change of volume-mean T and its drift over one more window are below `equilibrium_tol` (°C); see `equilibrium_check`. `nothing` runs for the full `simulation_time`.
 - `output_interval`, `snapshot_interval`, `checkpoint_interval`: model time between 3D snapshots, `_section` (zonal-mean lat × z) and
   `_surface` (top-cell lat × lon) snapshots, and checkpoints (`nothing` for none).
 """
@@ -555,7 +557,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                           checkpoint = isnothing(warm_start) ? nothing : latest_checkpoint(warm_start))))
     end
 
-    equilibrium = isnothing(equilibrium_tol) ? nothing : equilibrium_check(equilibrium_tol, equilibrium_window)
+    equilibrium = isnothing(equilibrium_tol) ? nothing : equilibrium_check(equilibrium_tol, equilibrium_window, rho_seawater * cp_seawater * ocean_depth)
     simulation.callbacks[:progress] = Callback(progress_callback(model, surface_heat_flux(model, relaxation), equilibrium), IterationInterval(100))
     simulation.callbacks[:wizard] = Callback(TimeStepWizard(; cfl, max_change = 1.05, max_Δt), IterationInterval(10))
     global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale)

@@ -118,13 +118,20 @@ function velocity_boundary_conditions(wind_field, wind_stress = nothing)
            FieldBoundaryConditions(top = FluxBoundaryCondition(wind_stress_v, parameters = p), bottom = v_bottom)
 end
 
-# κ_horizontal = 0 omits the horizontal tracer diffusivity
-function ocean_closure(; κ_horizontal, ν_vertical = 1e-4, κ_vertical = 1e-4)
+const VERTICAL_MIXING = (:catke, :convective_adjustment)
+
+# κ_horizontal = 0 omits the horizontal tracer diffusivity; vertical_mixing is added to the constant ν_vertical, κ_vertical background
+function ocean_closure(; κ_horizontal, ν_vertical = 1e-4, κ_vertical = 1e-4, vertical_mixing = :catke)
+    vertical_mixing in VERTICAL_MIXING || error("vertical_mixing must be one of $(VERTICAL_MIXING), got $(repr(vertical_mixing))")
     horizontal = iszero(κ_horizontal) ? nothing : HorizontalScalarDiffusivity(κ = κ_horizontal)
-    closures = (VerticalScalarDiffusivity(ν = ν_vertical, κ = κ_vertical), horizontal,
-                ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0))
+    mixing = vertical_mixing == :catke ? CATKEVerticalDiffusivity() :    # Wagner et al. (2025, JAMES 17, e2024MS004522)
+             ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0)
+    closures = (VerticalScalarDiffusivity(ν = ν_vertical, κ = κ_vertical), horizontal, mixing)
     return Tuple(c for c in closures if !isnothing(c))
 end
+
+# A run's vertical mixing scheme from its parameter file; older files predate the option, when convective adjustment was the only one
+run_vertical_mixing(parameters) = Symbol(get(parameters["physics"], "vertical_mixing", "convective_adjustment"))
 
 # Smallest grid halo (at least 3) the schemes and closures need, checked on a small CPU grid of the same type
 function required_halo(momentum, tracers, closure, max_lat=80)
@@ -147,10 +154,12 @@ end
 drop_state_key(x, key) = x
 drop_state_key(nt::NamedTuple, key) = (; (name => drop_state_key(value, key) for (name, value) in pairs(nt) if name != key)...)
 
-# Restore a same-grid checkpoint (model, Δt and the schedules of output writers already added); reset_clock starts a fresh run from it
-function restore_checkpoint!(simulation, path; drop_salinity, reset_clock)
+# Restore a same-grid checkpoint (model, Δt and the schedules of output writers already added), without the state keys in `drop`;
+# new_closure skips the saved closure fields (for a different vertical mixing scheme); reset_clock starts a fresh run from it
+function restore_checkpoint!(simulation, path; drop, new_closure = false, reset_clock)
     state = Oceananigans.OutputWriters.load_checkpoint_state(path)
-    drop_salinity && (state = drop_state_key(state, :S))
+    state = foldl(drop_state_key, drop; init = state)
+    new_closure && (state = merge(state, (; model = merge(state.model, (; closure_fields = nothing)))))    # the model reads it by name
     Oceananigans.restore_prognostic_state!(simulation, state)
     if reset_clock
         simulation.model.clock.time = zero(simulation.model.clock.time)
@@ -441,6 +450,8 @@ Keywords:
 - `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
 - `κ_horizontal`: horizontal horizontal tracer diffusivity (0 for none).
 - `ν_vertical`, `κ_vertical`: background vertical viscosity and tracer diffusivity (m²/s).
+- `vertical_mixing`: `:catke` (default; CATKE, Wagner et al. 2025) or `:convective_adjustment`, added to the background. A restart
+  keeps its run's scheme (convective adjustment for runs that predate the option), so leave it as `nothing` or pass the same one.
 - `wind_field`: `(lon, lat, t) -> (u_wind, v_wind)` in m/s for a bulk wind stress.
 - `emulator_wind`, `surface_pressure`: force with CLERO-emulated winds of the planet whose emulated (T_day, T_night) match this run's at
   surface pressure `surface_pressure` (bar). The wind file is solved by `src/climate/climate_emulator.py` (Python env `\$EXO_EMULATOR_PYTHON`)
@@ -463,7 +474,7 @@ Keywords:
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
                           resolution = 1.0, max_lat = 80, n_depth = 20,
                           use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
-                          κ_horizontal = 1e3, ν_vertical = 1e-4, κ_vertical = 1e-4,
+                          κ_horizontal = 1e3, ν_vertical = 1e-4, κ_vertical = 1e-4, vertical_mixing = nothing,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0,
                           cfl = 0.2, max_Δt = nothing,
@@ -481,10 +492,16 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         Δlon, Δlat = resolution isa Tuple ? resolution : (resolution, resolution)
         n_lon, n_lat = grid_cells(360, Δlon, "longitude"), grid_cells(2max_lat, Δlat, "latitude")
     else
-        g = donor_grid(read_parameters(restart))
+        restart_parameters = read_parameters(restart)
+        g = donor_grid(restart_parameters)
         (; n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type) = g
         resolution = (360 / n_lon, 2max_lat / n_lat)
+        run_mixing = run_vertical_mixing(restart_parameters)
+        isnothing(vertical_mixing) || Symbol(vertical_mixing) == run_mixing ||
+            error("$(restart) ran with vertical_mixing = :$(run_mixing), so it can't continue with :$(vertical_mixing)")
+        vertical_mixing = run_mixing
     end
+    vertical_mixing = Symbol(something(vertical_mixing, :catke))
     max_Δt = something(max_Δt, default_max_Δt(rotational_period, max_lat))
 
     # Sets up wind
@@ -500,7 +517,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     arch = select_architecture(use_GPU)
     momentum = WENOVectorInvariant(order = 5)
     tracers_adv = WENO(order = 5)
-    closure = ocean_closure(; κ_horizontal, ν_vertical, κ_vertical)
+    closure = ocean_closure(; κ_horizontal, ν_vertical, κ_vertical, vertical_mixing)
     halo = required_halo(momentum, tracers_adv, closure)
     grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching, max_lat)
 
@@ -538,10 +555,13 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     isnothing(salinity) || set!(model, S = salinity)
 
     simulation = Simulation(model, Δt = 2minutes, stop_time = simulation_time)
-    
+    no_salinity = isnothing(salinity) ? (:S,) : ()
+
     if !isnothing(warm_start) && !regrid
         @info "Warm-starting from $(latest_checkpoint(warm_start)) on the same grid"
-        restore_checkpoint!(simulation, latest_checkpoint(warm_start); drop_salinity = isnothing(salinity), reset_clock = true)
+        new_closure = run_vertical_mixing(donor_parameters) != vertical_mixing    # the new scheme starts its own TKE and diffusivities
+        restore_checkpoint!(simulation, latest_checkpoint(warm_start); drop = (no_salinity..., (new_closure ? (:e,) : ())...),
+                            new_closure, reset_clock = true)
     end
 
     if isnothing(restart)
@@ -549,8 +569,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             planet = (; rotational_period, ocean_depth, planet_radius, T_day, T_night),
             grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
                     z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
-            physics = (; κ_horizontal, ν_vertical, κ_vertical, heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity,
-                       wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
+            physics = (; κ_horizontal, ν_vertical, κ_vertical, vertical_mixing = string(vertical_mixing),
+                       heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
                        wind_file, wind_stress_scale),
             time = (; simulation_time, cfl, max_Δt, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval),
             warm_start = (; donor = warm_start, regridded = regrid,
@@ -566,7 +586,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
 
     if !isnothing(restart)    # after the writers exist, so their schedules are restored too
         checkpoint = latest_checkpoint(restart)
-        restore_checkpoint!(simulation, checkpoint; drop_salinity = isnothing(salinity), reset_clock = false)
+        restore_checkpoint!(simulation, checkpoint; drop = no_salinity, reset_clock = false)
         t₀ = simulation.model.clock.time
         if resume
             simulation_time = planned_end(read_parameters(restart)) - t₀

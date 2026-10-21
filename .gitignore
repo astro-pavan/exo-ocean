@@ -2,6 +2,7 @@ output
 *.png
 .claude
 docs/LLM/
+docs/derivations/*.jpg
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

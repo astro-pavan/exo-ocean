@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.special import gamma, gammainc, hyp1f1
 
 xi = np.pi / 4
 chi = 1
@@ -105,8 +106,54 @@ class dry_planet(planet):
 
         return T_surf_day, T_atm_day, T_atm_night, T_surf_night, wind
 
+# dry_planet with the grey adiabatic columns of Koll & Abbot (2016) for any optical depth, closed by their heat-engine wind (eq. 12)
+# derivation in docs/derivations/thick_atmosphere_two_column.md, equation numbers from its Section 10
 class thick_atmosphere_dry_planet(dry_planet):
-    pass
+
+    def __init__(self, R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean=0, c_ocean=1800, T_solidus=1700, eps_wind=0.5, beta_night=None):
+        super().__init__(R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean, c_ocean, T_solidus)
+        self.eps = eps_wind # surface wind as a fraction of the ideal heat engine, GCM winds are ~1/2 of it (KA16 Fig. 6b)
+
+        self.beta = self.R_gas / self.cp # dry adiabat in optical depth, n = 1 as kappa is pressure independent (KA16 eq. 7)
+        self.beta_night = self.beta if beta_night is None else beta_night # 0 gives an isothermal nightside column
+
+        self.t = np.exp(-self.tau) # transmission of surface emission to space
+        self.U_day, self.D_day = self.emission(self.beta)
+        self.U_night, self.D_night = self.emission(self.beta_night)
+
+        self.E = self.R_gas * self.T_max * sigma * self.T_max**4 / (self.CD * self.P * self.W0**3)
+
+    # fractions of sigma T_a^4 emitted to space (U) and to the surface (D) by an adiabatic grey column (KA16 eq. 8)
+    def emission(self, beta):
+        a = 1 + 4 * beta
+        U = self.tau**(1 - a) * gammainc(a, self.tau) * gamma(a)
+        D = self.tau / a * hyp1f1(1, 1 + a, -self.tau)
+        return U, D
+
+    def residuals(self, x):
+
+        T0, T1, T2, T3, W = x
+
+        C = (xi * self.CT) / (chi * self.CD)
+        V = self.alpha * np.sqrt(self.cp * self.R_gas * self.T_max / self.cv) / self.W0
+
+        T_sd, T_ad, T_an, T_sn = T0, T0 * T1, T0 * T1 * T2, T0 * T1 * T2 * T3 # in units of T_max
+
+        Fsd = self.tau * W * (1 - T1**-1)
+        Fsn = self.tau * W * (1 - T3)
+        Fa = self.tau * C * V * T_ad**1.5 * (1 - T2)
+        Fo = self.O * np.maximum(T0 - np.maximum(T_sn, self.T_solidus / self.T_max), 0) # as in dry_planet
+
+        Q = 1 - Fo - self.t * T_sd**4 # heat entering the dayside atmosphere from the surface
+        eta = np.maximum(1 - 2**-0.25 / T0, 0) # Carnot efficiency between T_s,d and T_eq
+
+        r0 = 1 + self.D_day * T_ad**4 + Fsd - Fo - T_sd**4 # eq. 1
+        r1 = (1 - self.t) * T_sd**4 - (self.U_day + self.D_day) * T_ad**4 - Fsd - Fa # eq. 2
+        r2 = (1 - self.t) * T_sn**4 - (self.U_night + self.D_night) * T_an**4 - Fsn + Fa # eq. 3
+        r3 = self.D_night * T_an**4 + Fsn + Fo - T_sn**4 # eq. 4
+        r4 = W**3 - self.eps**3 * eta * Q * self.E * T_ad # eq. 5
+
+        return np.array([r0, r1, r2, r3, r4])
 
 # from Yang & Abbot (2014); the hooks before residuals are overridden by runaway_wet_planet
 class wet_planet(planet):

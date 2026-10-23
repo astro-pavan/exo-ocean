@@ -63,7 +63,7 @@ end
 
 # How a swept value appears in a run name, as (before, after) the value: P10, nu1e-5, 0.5deg, wind3bar
 const NAME_TAGS = Dict(:rotational_period => ("P", ""), :T_day => ("Tday", ""), :T_night => ("Tnight", ""), :ocean_depth => ("D", "m"),
-                       :resolution => ("", "deg"), :n_depth => ("nz", ""), :ν_vertical => ("nu", ""), :κ_vertical => ("kv", ""),
+                       :resolution => ("", "deg"), :n_depth => ("nz", ""), :prandtl => ("Pr", ""), :κ_vertical => ("kv", ""),
                        :κ_horizontal => ("kh", ""), :surface_pressure => ("wind", "bar"), :vertical_mixing => ("", ""))
 compact(x::Real) = isinteger(x) ? string(Int(x)) : abs(x) < 0.01 ? replace(@sprintf("%.0e", x), "e-0" => "e-") : string(x)
 compact(x) = string(x)

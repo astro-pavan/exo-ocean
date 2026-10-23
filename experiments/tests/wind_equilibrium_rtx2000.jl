@@ -12,7 +12,7 @@ case = only(ARGS)
 case in ("nowind", "2", "10") || error("case must be nowind, 2 or 10 (bar), not $(case)")
 
 base = (; rotational_period = 10, ocean_depth = 1000.0, T_day = 30.0, T_night = 0.0, resolution = 2.0, n_depth = 16,
-        float_type = Float64, use_GPU = true, vertical_mixing = :catke, κ_vertical = 1e-4)
+        float_type = Float64, use_GPU = true, vertical_mixing = :catke, κ_vertical = 1e-4, prandtl = 1)
 wind = case == "nowind" ? (; emulator_wind = false) : (; emulator_wind = true, surface_pressure = parse(Int, case))
 tag = case == "nowind" ? "nowind" : "wind$(case)bar"
 equilibrium_tol = EQUILIBRIUM_TOL * (base.T_day - base.T_night)
@@ -28,5 +28,5 @@ if case != "nowind"
         @error "windeq_$(tag)_nz32 failed; continuing to the κ = 1e-5 run" exception = (err, catch_backtrace())
     end
 end
-simulation(merge(base, wind, (; name = "windeq_$(tag)_kv1e-5", κ_vertical = 1e-5, simulation_time = 80 * 365days, equilibrium_tol,
+simulation(merge(base, wind, (; name = "windeq_$(tag)_kv1e-5", κ_vertical = 1e-5, prandtl = 10, simulation_time = 80 * 365days, equilibrium_tol,
                               checkpoint_interval = 10 * 365days)), nothing, spin_up)

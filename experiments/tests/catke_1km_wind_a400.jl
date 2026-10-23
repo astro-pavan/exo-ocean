@@ -8,7 +8,7 @@ include(joinpath(@__DIR__, "..", "..", "src", "ocean", "simulation_sweep.jl"))
 
 use_GPU = get(ENV, "USE_GPU", "false") == "true"
 base = (; rotational_period = 10, ocean_depth = 1000.0, T_day = 30.0, T_night = 0.0, n_depth = 16, float_type = Float64, use_GPU,
-        vertical_mixing = :catke)
+        vertical_mixing = :catke, prandtl = 1)    # ν = κ = 1e-4, the background before the Prandtl number was an input
 wind = merge(base, (; emulator_wind = true))
 shared = (; low_res_start = nothing, warm_start = "base1km_spinup", prefix = "catke1km", resolution = [1.0])
 

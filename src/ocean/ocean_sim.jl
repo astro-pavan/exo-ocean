@@ -120,18 +120,25 @@ end
 
 const VERTICAL_MIXING = (:catke, :convective_adjustment)
 
-# κ_horizontal = 0 omits the horizontal tracer diffusivity; vertical_mixing is added to the constant ν_vertical, κ_vertical background
-function ocean_closure(; κ_horizontal, ν_vertical = 1e-4, κ_vertical = 1e-4, vertical_mixing = :catke)
+# κ_horizontal = 0 omits the horizontal tracer diffusivity; vertical_mixing is added to the constant background of tracer diffusivity
+# κ_vertical and viscosity prandtl × κ_vertical
+function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 10, vertical_mixing = :catke)
     vertical_mixing in VERTICAL_MIXING || error("vertical_mixing must be one of $(VERTICAL_MIXING), got $(repr(vertical_mixing))")
     horizontal = iszero(κ_horizontal) ? nothing : HorizontalScalarDiffusivity(κ = κ_horizontal)
     mixing = vertical_mixing == :catke ? CATKEVerticalDiffusivity() :    # Wagner et al. (2025, JAMES 17, e2024MS004522)
              ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0)
-    closures = (VerticalScalarDiffusivity(ν = ν_vertical, κ = κ_vertical), horizontal, mixing)
+    closures = (VerticalScalarDiffusivity(ν = prandtl * κ_vertical, κ = κ_vertical), horizontal, mixing)
     return Tuple(c for c in closures if !isnothing(c))
 end
 
 # A run's vertical mixing scheme from its parameter file; older files predate the option, when convective adjustment was the only one
 run_vertical_mixing(parameters) = Symbol(get(parameters["physics"], "vertical_mixing", "convective_adjustment"))
+
+# A run's background Prandtl number from its parameter file; older files set the viscosity directly
+function run_prandtl(parameters)
+    p = parameters["physics"]
+    return haskey(p, "prandtl") ? Float64(p["prandtl"]) : p["ν_vertical"] / p["κ_vertical"]
+end
 
 # Smallest grid halo (at least 3) the schemes and closures need, checked on a small CPU grid of the same type
 function required_halo(momentum, tracers, closure, max_lat=80)
@@ -449,7 +456,10 @@ Keywords:
 - `vertical_stretching`: thickness ratio of adjacent vertical cells (√1.2 with 2× `n_depth` halves every default cell).
 - `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
 - `κ_horizontal`: horizontal horizontal tracer diffusivity (0 for none).
-- `ν_vertical`, `κ_vertical`: background vertical viscosity and tracer diffusivity (m²/s).
+- `κ_vertical`: background vertical tracer diffusivity (m²/s).
+- `prandtl`: background Prandtl number, so the background vertical viscosity is `prandtl × κ_vertical` (default 10, as in the
+  Pacanowski & Philander 1981 and KPP backgrounds). A restart keeps its run's value (ν/κ for runs that set ν directly), so leave it as
+  `nothing` or pass the same one.
 - `vertical_mixing`: `:catke` (default; CATKE, Wagner et al. 2025) or `:convective_adjustment`, added to the background. A restart
   keeps its run's scheme (convective adjustment for runs that predate the option), so leave it as `nothing` or pass the same one.
 - `wind_field`: `(lon, lat, t) -> (u_wind, v_wind)` in m/s for a bulk wind stress.
@@ -474,7 +484,7 @@ Keywords:
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
                           resolution = 1.0, max_lat = 80, n_depth = 20,
                           use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
-                          κ_horizontal = 1e3, ν_vertical = 1e-4, κ_vertical = 1e-4, vertical_mixing = nothing,
+                          κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0,
                           cfl = 0.2, max_Δt = nothing,
@@ -500,8 +510,14 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         isnothing(vertical_mixing) || Symbol(vertical_mixing) == run_mixing ||
             error("$(restart) ran with vertical_mixing = :$(run_mixing), so it can't continue with :$(vertical_mixing)")
         vertical_mixing = run_mixing
+        run_pr = run_prandtl(restart_parameters)
+        isnothing(prandtl) || isapprox(prandtl, run_pr; rtol = 1e-6) ||
+            error("$(restart) ran with prandtl = $(run_pr), so it can't continue with $(prandtl)")
+        prandtl = run_pr
     end
     vertical_mixing = Symbol(something(vertical_mixing, :catke))
+    prandtl = Float64(something(prandtl, 10))
+    ν_vertical = prandtl * κ_vertical
     max_Δt = something(max_Δt, default_max_Δt(rotational_period, max_lat))
 
     # Sets up wind
@@ -517,7 +533,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     arch = select_architecture(use_GPU)
     momentum = WENOVectorInvariant(order = 5)
     tracers_adv = WENO(order = 5)
-    closure = ocean_closure(; κ_horizontal, ν_vertical, κ_vertical, vertical_mixing)
+    closure = ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing)
     halo = required_halo(momentum, tracers_adv, closure)
     grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching, max_lat)
 
@@ -569,7 +585,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             planet = (; rotational_period, ocean_depth, planet_radius, T_day, T_night),
             grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
                     z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
-            physics = (; κ_horizontal, ν_vertical, κ_vertical, vertical_mixing = string(vertical_mixing),
+            physics = (; κ_horizontal, κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
                        heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
                        wind_file, wind_stress_scale),
             time = (; simulation_time, cfl, max_Δt, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval),

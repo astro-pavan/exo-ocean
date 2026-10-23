@@ -233,9 +233,11 @@ class wet_planet(planet):
 
     bounds = ((100, 100, 100, 0, 0), (400, 400, 400, 2000, 5000))
 
-    def __init__(self, R_planet, M_planet, R_star, T_star, F_star, F_ocean, P_surface=1e5):
+    def __init__(self, R_planet, M_planet, R_star, T_star, F_star, F_ocean, P_surface=1e5, J_ocean=None, c_ocean=3990):
         super().__init__(R_planet, M_planet, R_star, T_star, F_star)
-        self.Fo = F_ocean
+        self.Fo = F_ocean # fixed day-night ocean heat flux, W/m^2, used when J_ocean is None
+        self.J_ocean = J_ocean # day-night ocean mass flux, kg/s
+        self.c_ocean = c_ocean # seawater heat capacity, J/kg/K
         self.P = P_surface # in Pa, for the boundary layer humidity
 
         self.Tc = 230 # eq. 8
@@ -245,13 +247,13 @@ class wet_planet(planet):
         # Table 1
         self.Pa = 60000
         self.k1 = 0.2
-        self.k2 = 1000
+        self.k2 = 1000 * 13.7 / self.g # k2 = kappa Pa / g (eq. 10), tuned at YA14's g = 13.7 m/s^2
         self.k3 = 0.08
         self.RH1 = 0.9
         self.RH2 = 0.8
         self.RH3 = 0.3
 
-        self.Za = 5000 * np.log(self.P / self.Pa) # height of Pa for a 5000 m scale height (Section 3)
+        self.Za = 5000 * (13.7 / self.g) * np.log(self.P / self.Pa) # height of Pa; YA14's 5000 m scale height is for g = 13.7 m/s^2 (Section 3)
 
     def humidity(self, RH, T, P):
         return RH * q_sat(T, P)
@@ -271,6 +273,12 @@ class wet_planet(planet):
     def convection(self, MSE_s, MSE_a, Fc):
         return MSE_s - MSE_a # eq. 7
 
+    # fixed F_o, or the net advective flux of a mass flux J returning at the nightside surface temperature, per hemisphere area
+    def ocean_flux(self, T1, T4):
+        if self.J_ocean is None:
+            return self.Fo
+        return self.J_ocean * self.c_ocean * (T1 - T4) / (2 * np.pi * self.R_planet**2)
+
     def residuals(self, x):
 
         T1, T2, T4, Fa, Fc = x
@@ -278,6 +286,7 @@ class wet_planet(planet):
         T3 = T2 # eq. 6
 
         Fd = self.k1 * Fa # eq. 9
+        Fo = self.ocean_flux(T1, T4)
 
         e2 = self.emissivity(self.RH2, T2)
         e3 = self.emissivity(self.RH3, T3)
@@ -285,10 +294,10 @@ class wet_planet(planet):
         fc = self.cloud_fraction(Fc)
         A = self.A_planet + fc - self.A_planet * fc # eq. 14
 
-        r0 = 0.5 * self.S0 * (1 - A) - Fc - self.Fo + (1 - fc) * e2 * sigma * T2**4 + fc * sigma * self.Tc**4 - sigma * T1**4 # eq.2
+        r0 = 0.5 * self.S0 * (1 - A) - Fc - Fo + (1 - fc) * e2 * sigma * T2**4 + fc * sigma * self.Tc**4 - sigma * T1**4 # eq.2
         r1 = Fc - Fa + (1 - fc) * e2 * sigma * T1**4 + fc * sigma * T1**4 - (1 - fc) * (e2 * sigma * T2**4 + self.OLR_clear(T2, e2)) - 2 * fc * sigma * self.Tc**4 # eq. 3
         r2 = Fa - Fd + e3 * sigma * T4**4 - e3 * sigma * T3**4 - self.OLR_clear(T3, e3) + self.F_str(T3) # eq.4
-        r3 = self.Fo + Fd + e3 * sigma * T3**4 - sigma * T4**4 # eq. 5
+        r3 = Fo + Fd + e3 * sigma * T3**4 - sigma * T4**4 # eq. 5
 
         MSE_s = cp_air * T1 + L_water * self.humidity(self.RH1, T1, self.P) # eq. 11
         MSE_a = cp_air * T2 + L_water * self.humidity(1, T2, self.Pa) + self.g * self.Za # eq. 12
@@ -316,8 +325,8 @@ class runaway_wet_planet(wet_planet):
     bounds = ((100, 100, 100, 0, 0), (1500, 1500, 1500, 1e4, 1e5))
 
     def __init__(self, R_planet, M_planet, R_star, T_star, F_star, F_ocean=0, P_surface=1e5,
-                 runaway_olr=True, night_cloud=True, fc_fixed=None):
-        super().__init__(R_planet, M_planet, R_star, T_star, F_star, F_ocean, P_surface)
+                 runaway_olr=True, night_cloud=True, fc_fixed=None, J_ocean=None, c_ocean=3990):
+        super().__init__(R_planet, M_planet, R_star, T_star, F_star, F_ocean, P_surface, J_ocean, c_ocean)
 
         self.runaway_olr = runaway_olr
         self.night_cloud = night_cloud

@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, brentq
 from scipy.special import gamma, gammainc, hyp1f1
 
 xi = np.pi / 4
@@ -20,6 +20,7 @@ def q_sat(T, P):
 class planet:
 
     bounds = None
+    solver_options = {}
 
     def __init__(self, R_planet, M_planet, R_star, T_star, F_star):
 
@@ -31,12 +32,23 @@ class planet:
         self.S0 = F_star
         self.a = np.sqrt(L_star / (4 * np.pi * F_star))
 
+    # build from an experiments/planet_parameters.planet_parameters object; extra arguments go to the model's __init__
+    @classmethod
+    def from_parameters(cls, params, *args, **kwargs):
+        return cls(params.R_planet, params.M_planet, params.R_star, params.T_star, params.F_star, *args, **kwargs)
+
     def residuals(self, x):
         return np.array([0])
 
-    def solve(self, x0, bounds=None):
+    def initial_guess(self):
+        raise NotImplementedError(f"{type(self).__name__} has no initial_guess, pass x0 to solve")
 
-        res = least_squares(self.residuals, x0, bounds=self.bounds if bounds is None else bounds)
+    def solve(self, x0=None, bounds=None):
+
+        if x0 is None:
+            x0 = self.initial_guess()
+
+        res = least_squares(self.residuals, x0, bounds=self.bounds if bounds is None else bounds, **self.solver_options)
 
         if res.success:
             return res.x
@@ -45,10 +57,18 @@ class planet:
 class dry_planet(planet):
 
     bounds = ((0, 0, 0, 0, 0), (np.inf, 1, 1, np.inf, np.inf)) # T3 > 1 allowed: ocean heating can warm the night surface above the air
+    solver_options = dict(x_scale='jac', ftol=1e-15, xtol=1e-15, gtol=1e-15, max_nfev=20000) # residuals are tiny and badly scaled at low tau
 
-    def __init__(self, R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean=0, c_ocean=1800, T_solidus=1700):
+    def __init__(self, R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean=0, c_ocean=1800, T_solidus=1700,
+                 alpha_scaling=None, rotation_period=None):
         super().__init__(R_planet, M_planet, R_star, T_star, F_star)
-        self.alpha = alpha_wind
+        self.alpha = alpha_wind # ignored when alpha_scaling is set
+        if alpha_scaling not in (None, 'WTG', 'coriolis'):
+            raise ValueError("alpha_scaling must be None, 'WTG' or 'coriolis'")
+        if alpha_scaling == 'coriolis' and rotation_period is None:
+            raise ValueError("the coriolis scaling needs rotation_period (s)")
+        self.alpha_scaling = alpha_scaling
+        self.rotation_period = rotation_period # in s, equal to the orbital period when tidally locked
         self.P = P_surface # in Pa
         self.J_ocean = J_ocean # magma mass flux from day to night, kg/s
         self.c_ocean = c_ocean # molten silicate, Lai et al. (2024) Table 1
@@ -75,12 +95,56 @@ class dry_planet(planet):
 
         self.O = self.J_ocean * self.c_ocean / (2 * np.pi * self.R_planet**2 * sigma * self.T_max**3)
 
+        self.V0 = np.sqrt(self.cp * self.R_gas * self.T_max / self.cv) / self.W0 # V = alpha * V0 (eq. 30)
+
+        if alpha_scaling == 'coriolis':
+            T_eq = self.T_star * np.sqrt(self.R_star / (2 * self.a)) * (1 - self.A_planet)**0.25 # eq. 2
+            self.Lambda = np.sqrt(self.R_gas * T_eq) * self.rotation_period / (2 * np.pi * self.R_planet) # eq. 1
+
+    # as planet.from_parameters, also taking the rotation period from params
+    @classmethod
+    def from_parameters(cls, params, *args, **kwargs):
+        kwargs.setdefault('rotation_period', params.P_rotation)
+        return super().from_parameters(params, *args, **kwargs)
+
+    # longitudinal wind efficiency: fixed, or set by the day-night contrast (Wirth et al. 2026 Section 4.2)
+    def alpha_at(self, T0, T1, T2):
+        if self.alpha_scaling == 'WTG':
+            return np.sqrt(np.maximum(1 - T2, 0)) # eq. 54
+        if self.alpha_scaling == 'coriolis':
+            return 2**0.25 * (self.cv / self.cp) * np.sqrt(T0 * T1) * self.Lambda * (1 - T2) # eq. 58
+        return self.alpha
+
+    # escaping fraction of surface emission, and day/night atmospheric emission to space per sigma T_a^4 (W26 thin limit)
+    def column_emission(self):
+        return max(1 - self.tau, 0), self.tau, self.tau
+
+    # return-flow wind for the guess: |w| ~ |v|, which W26 eq. 46 nearly reduces to
+    def wind_guess(self, T_d, x):
+        return self.alpha_at(T_d, 1.0, x) * self.V0 * np.sqrt(T_d)
+
+    # with surface = air on each side the column budgets and global balance reduce to one equation in x = T_a,n / T_a,d
+    def initial_guess(self):
+        t, U_d, U_n = self.column_emission()
+        C = (xi * self.CT) / (chi * self.CD)
+        T_day = lambda x: ((t + U_d) + (t + U_n) * x**4)**-0.25 # global balance
+
+        def night_balance(x):
+            T_d = T_day(x)
+            Fa = self.tau * C * self.alpha_at(T_d, 1.0, x) * self.V0 * T_d**1.5 * (1 - x)
+            Fo = self.O * np.maximum(T_d - np.maximum(T_d * x, self.T_solidus / self.T_max), 0)
+            return (t + U_n) * (T_d * x)**4 - Fa - Fo
+
+        x = brentq(night_balance, 1e-6, 1.0) if night_balance(1e-6) < 0 else 1e-6 # negative at 0, positive at 1
+        T_d = T_day(x)
+        return np.array([T_d, 0.99, x, 0.99, max(self.wind_guess(T_d, x), 1e-3)])
+
     def residuals(self, x):
 
         T0, T1, T2, T3, W = x
 
         C = (xi * self.CT) / (chi * self.CD)
-        V = self.alpha * np.sqrt(self.cp * self.R_gas * self.T_max / self.cv) / self.W0
+        V = self.alpha_at(T0, T1, T2) * self.V0
         L = chi * self.CD * self.cp * self.R_planet * self.g / (self.R_gas**2 * self.T_max)
 
         # net day-night magma transport (Hall & Bryden 1982); melt returns at T_s,n, or at the solidus if the nightside is frozen
@@ -110,8 +174,9 @@ class dry_planet(planet):
 # derivation in docs/derivations/thick_atmosphere_two_column.md, equation numbers from its Section 10
 class thick_atmosphere_dry_planet(dry_planet):
 
-    def __init__(self, R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean=0, c_ocean=1800, T_solidus=1700, eps_wind=0.5, beta_night=None):
-        super().__init__(R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean, c_ocean, T_solidus)
+    def __init__(self, R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean=0, c_ocean=1800, T_solidus=1700, eps_wind=0.5, beta_night=None,
+                 alpha_scaling=None, rotation_period=None):
+        super().__init__(R_planet, M_planet, R_star, T_star, F_star, alpha_wind, P_surface, J_ocean, c_ocean, T_solidus, alpha_scaling, rotation_period)
         self.eps = eps_wind # surface wind as a fraction of the ideal heat engine, GCM winds are ~1/2 of it (KA16 Fig. 6b)
 
         self.beta = self.R_gas / self.cp # dry adiabat in optical depth, n = 1 as kappa is pressure independent (KA16 eq. 7)
@@ -130,12 +195,20 @@ class thick_atmosphere_dry_planet(dry_planet):
         D = self.tau / a * hyp1f1(1, 1 + a, -self.tau)
         return U, D
 
+    def column_emission(self):
+        return self.t, self.U_day, self.U_night
+
+    # heat-engine wind (eq. 5) with surface = air
+    def wind_guess(self, T_d, x):
+        eta = max(1 - 2**-0.25 / T_d, 0)
+        return (self.eps**3 * eta * (1 - self.t * T_d**4) * self.E * T_d)**(1 / 3)
+
     def residuals(self, x):
 
         T0, T1, T2, T3, W = x
 
         C = (xi * self.CT) / (chi * self.CD)
-        V = self.alpha * np.sqrt(self.cp * self.R_gas * self.T_max / self.cv) / self.W0
+        V = self.alpha_at(T0, T1, T2) * self.V0
 
         T_sd, T_ad, T_an, T_sn = T0, T0 * T1, T0 * T1 * T2, T0 * T1 * T2 * T3 # in units of T_max
 

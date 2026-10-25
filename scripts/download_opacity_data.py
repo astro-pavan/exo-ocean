@@ -12,10 +12,11 @@ Sources, from https://lab.pages.in2p3.fr/whiplash-public/exo_k/where_to_find_dat
   MT_CKD 4.3 (Mlawer et al. 2012, 2023; github.com/AER-RC/MT_CKD_H2O): H2O self and foreign continuum.
 H2 has no ExoMol line list (its quadrupole lines are negligible), so H2 enters only through CIA. HITRAN has no CO CIA.
 
-Layout: H2O/, CO2/, CO/ hold k-tables; cia/ holds tables that can all be loaded with exo_k.Cia_table and summed; source/ holds
-raw files that cia/ tables are built from (not for direct use). Two cia/ products are built here rather than downloaded:
-  CO2-CO2_2024_<band>.h5   The HITRAN 2024 CO2-CO2 file holds ten blocks from several studies over five bands, and exo_k only
-                           reads the first block. Each band becomes one table on a common wavenumber grid.
+Layout: H2O/, CO2/, CO/ hold k-tables; cia/ holds one table per molecule pair (exo_k's CIAdatabase keeps only one per pair),
+all loadable with exo_k.Cia_table; source/ holds raw files that cia/ tables are built from (not for direct use). Two cia/
+products are built here rather than downloaded:
+  CO2-CO2_2024.h5          The HITRAN 2024 CO2-CO2 file holds ten blocks from several studies over five bands, and exo_k only
+                           reads the first block. The bands are merged into one table (see build_co2_co2_cia).
   H2O-H2O_MT_CKD_4.3.h5,   MT_CKD self and foreign (air, stored as N2) continua as CIA coefficients. MT_CKD assumes line
   H2O-N2_MT_CKD_4.3.h5     opacity is cut 25 cm-1 from line centre; the ExoMol tables cut at <= 25 cm-1, so it does not double
                            count. The self continuum's temperature power law is only constrained near 250-350 K.
@@ -56,6 +57,7 @@ CO2_CO2_FILE = "CO2-CO2_2024.cia"
 # different study) is ~30% above the 295 K block of the 230-295 K set, so merging it would put a jump in T; it is left out.
 CO2_CO2_BANDS = [(1, 750), (1120, 1850), (2510, 2850), (2850, 3250), (3995, 4500)]
 CO2_CO2_SKIP = {(2850, 298.0)}    # (band lower edge, block temperature)
+BAND_EDGE_STEP = 0.01             # cm^-1 beyond each band edge where the merged CO2-CO2 table drops to POSITIVE_FLOOR
 
 MT_CKD_TGRID = np.arange(200., 701., 25.)    # same span as the LMDZ generic-model CKD tables
 POSITIVE_FLOOR = 1e-60                       # cm^5 molecule^-2, ~15 orders below any real CIA value here
@@ -126,27 +128,41 @@ def read_hitran_blocks(path):
     return blocks
 
 
-def build_co2_co2_bands(force=False):
-    """Split the multi-band HITRAN CO2-CO2 file into one exo_k table per band (see CO2_CO2_BANDS).
+def build_co2_co2_cia(force=False):
+    """Merge the multi-band HITRAN CO2-CO2 file (bands in CO2_CO2_BANDS) into one exo_k table, CO2-CO2_2024.h5.
 
-    Blocks in a band come from different studies on different grids; they are interpolated onto the finest block's grid
-    over the wavenumbers every block covers.
+    Within a band, blocks come from different studies on different grids; they are interpolated onto the finest block's
+    grid over the wavenumbers every block covers. The bands are then put on the union of their temperatures, each band
+    interpolated linearly in log(k) and held at its own edge temperatures, which is what exo_k does when interpolating a
+    single band's table. Points BAND_EDGE_STEP outside each band are set to POSITIVE_FLOOR, so that the linear wavenumber
+    interpolation in exo_k's sample() does not fill the gaps between bands.
     """
+    path = CIA_DIR / "CO2-CO2_2024.h5"
+    if path.exists() and not force:
+        print(f"exists   {path.relative_to(REPO_ROOT)}")
+        return
     blocks = read_hitran_blocks(SOURCE_DIR / CO2_CO2_FILE)
+    bands = []    # (temperatures, wavenumbers, coefficients) per band
     for lo, hi in CO2_CO2_BANDS:
         band = [b for b in blocks if lo <= 0.5 * (b[1][0] + b[1][-1]) <= hi and (lo, b[0]) not in CO2_CO2_SKIP]
         band.sort(key=lambda b: b[0])
-        w_min, w_max = max(b[1][0] for b in band), min(b[1][-1] for b in band)
-        finest = min(band, key=lambda b: np.median(np.diff(b[1])))[1]
-        wns = finest[(finest >= w_min) & (finest <= w_max)]
-        path = CIA_DIR / f"CO2-CO2_2024_{w_min:.0f}-{w_max:.0f}.h5"
-        if path.exists() and not force:
-            print(f"exists   {path.relative_to(REPO_ROOT)}")
-            continue
         tgrid = np.array([b[0] for b in band])
         if np.unique(tgrid).size != tgrid.size:
             raise ValueError(f"duplicate temperatures in CO2-CO2 band {lo}-{hi} cm-1: {tgrid}")
-        write_cia_table(path, ("CO2", "CO2"), wns, tgrid, np.array([np.interp(wns, w, k) for _, w, k in band]))
+        w_min, w_max = max(b[1][0] for b in band), min(b[1][-1] for b in band)
+        finest = min(band, key=lambda b: np.median(np.diff(b[1])))[1]
+        wns = finest[(finest >= w_min) & (finest <= w_max)]
+        k = np.maximum(np.array([np.interp(wns, w, kb) for _, w, kb in band]), POSITIVE_FLOOR)
+        bands.append((tgrid, wns, k))
+
+    tgrid = np.unique(np.concatenate([b[0] for b in bands]))
+    wns_parts, k_parts = [], []
+    for t_band, w_band, k_band in bands:
+        log_k = np.array([[np.interp(t, t_band, col) for t in tgrid] for col in np.log(k_band).T]).T   # (Nt, Nw)
+        floor = np.full((tgrid.size, 1), POSITIVE_FLOOR)
+        wns_parts.append(np.concatenate(([w_band[0] - BAND_EDGE_STEP], w_band, [w_band[-1] + BAND_EDGE_STEP])))
+        k_parts.append(np.hstack((floor, np.exp(log_k), floor)))
+    write_cia_table(path, ("CO2", "CO2"), np.concatenate(wns_parts), tgrid, np.hstack(k_parts))
 
 
 def build_mt_ckd(force=False):
@@ -199,7 +215,7 @@ def main():
     if failed:
         sys.exit(f"{len(failed)} download(s) failed")
     if args.only in ("all", "cia"):
-        build_co2_co2_bands(args.force)
+        build_co2_co2_cia(args.force)
         build_mt_ckd(args.force)
 
 

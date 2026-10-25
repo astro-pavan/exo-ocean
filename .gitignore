@@ -230,3 +230,6 @@ __marimo__/
 env.sh
 LocalPreferences.toml
 logs/
+
+# Downloaded opacity tables (scripts/download_opacity_data.py)
+src/two_column/opacity_data/

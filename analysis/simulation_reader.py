@@ -352,5 +352,6 @@ class SimulationData:
 
 if __name__ == '__main__':
 
-    data = SimulationData('output/ocean/deepeq_P_10_dT_30.0_D_1.nc')
+    data = SimulationData('output/wind1km_shared_wind2bar_1deg.nc')
     data.jet_properties()
+    data.deep_circulation_properties()

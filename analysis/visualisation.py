@@ -448,7 +448,7 @@ class InteractivePlot:
 
 # Bokeh app: bokeh serve --show analysis/visualisation.py --args <output .nc file>  (bokeh names the app module bokeh_app_*)
 if __name__.startswith("bokeh_app_"):
-    sim_file = sys.argv[1] if len(sys.argv) > 1 else str("deepeq_P_10_dT_30.0_D_1.nc")
+    sim_file = sys.argv[1] if len(sys.argv) > 1 else str("output/wind1km_shared_wind2bar_1deg.nc")
     interactive_plot = InteractivePlot(sim_file)
     curdoc().add_root(interactive_plot.get_layout())
     curdoc().title = "3D Quiver Plots"

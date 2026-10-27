@@ -1,5 +1,7 @@
 output
 *.png
+*.mp4
+*.gif
 .claude
 docs/LLM/
 docs/derivations/*.jpg

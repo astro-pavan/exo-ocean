@@ -4,9 +4,11 @@ using Oceananigans.Units
 using Oceananigans.AbstractOperations: @at, Average
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.BoundaryConditions: fill_halo_regions!
-using Oceananigans.Diagnostics: AdvectiveCFL
+using Oceananigans.Diagnostics: AdvectiveCFL, hasnan
 using Oceananigans.Fields: interpolate
 using Oceananigans.Grids: λnode, φnode
+using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ
+using Oceananigans.TurbulenceClosures: IsopycnalSkewSymmetricDiffusivity
 using NCDatasets
 using Statistics
 using TOML
@@ -94,6 +96,21 @@ end
     return -rho_air * C_D_wind * sqrt(u_wind^2 + v_wind^2) * v_wind / rho_seawater
 end
 
+# Bulk stress from the 10 m wind relative to α = 1 − s_w of the top-cell current (p from emulator_current_feedback)
+@inline function current_feedback_stress_u(i, j, grid, clock, fields, p)
+    k = grid.Nz
+    Ux = @inbounds p.Ux_u[i, j] - p.α * fields.u[i, j, k]
+    Uy = @inbounds p.Uy_u[i, j] - p.α * ℑxyᶠᶜᵃ(i, j, k, grid, fields.v)
+    return @inbounds bulk_stress(Ux, Uy, p.ρ_u[i, j], Ux, p.scale)
+end
+
+@inline function current_feedback_stress_v(i, j, grid, clock, fields, p)
+    k = grid.Nz
+    Ux = @inbounds p.Ux_v[i, j] - p.α * ℑxyᶜᶠᵃ(i, j, k, grid, fields.u)
+    Uy = @inbounds p.Uy_v[i, j] - p.α * fields.v[i, j, k]
+    return @inbounds bulk_stress(Ux, Uy, p.ρ_v[i, j], Uy, p.scale)
+end
+
 # Relax SST toward a day-night equilibrium (hottest at the substellar point) with a fixed piston velocity p.W = λ / ρc_p (Haney 1971)
 @inline function surface_relaxation(i, j, grid, clock, fields, p)
     k = grid.Nz
@@ -104,11 +121,15 @@ end
     return p.W * (T - T_eq)  # positive flux cools
 end
 
-# wind_stress = (τx, τy): kinematic stress arrays at u- and v-points (e.g. from emulator_wind_stress), used as array-valued top fluxes
+# wind_stress = (τx, τy): kinematic stress arrays at u- and v-points (e.g. from emulator_wind_stress), used as array-valued top fluxes,
+# or the parameters from emulator_current_feedback for a stress that depends on the surface current
 function velocity_boundary_conditions(wind_field, wind_stress = nothing)
     u_bottom = FluxBoundaryCondition(bottom_drag_u, discrete_form = true)
     v_bottom = FluxBoundaryCondition(bottom_drag_v, discrete_form = true)
-    if !isnothing(wind_stress)
+    if wind_stress isa NamedTuple
+        return FieldBoundaryConditions(top = FluxBoundaryCondition(current_feedback_stress_u, discrete_form = true, parameters = wind_stress), bottom = u_bottom),
+               FieldBoundaryConditions(top = FluxBoundaryCondition(current_feedback_stress_v, discrete_form = true, parameters = wind_stress), bottom = v_bottom)
+    elseif !isnothing(wind_stress)
         return FieldBoundaryConditions(top = FluxBoundaryCondition(wind_stress[1]), bottom = u_bottom),
                FieldBoundaryConditions(top = FluxBoundaryCondition(wind_stress[2]), bottom = v_bottom)
     end
@@ -119,12 +140,17 @@ function velocity_boundary_conditions(wind_field, wind_stress = nothing)
 end
 
 const VERTICAL_MIXING = (:catke, :convective_adjustment)
+const HORIZONTAL_MIXING = (:gm_redi, :horizontal)
 
 # κ_horizontal = 0 omits the horizontal tracer diffusivity; vertical_mixing is added to the constant background of tracer diffusivity
-# κ_vertical and viscosity prandtl × κ_vertical
-function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 10, vertical_mixing = :catke)
+# κ_vertical and viscosity prandtl × κ_vertical. :gm_redi uses κ_horizontal as both the GM skew and the Redi isopycnal diffusivity,
+# tapered where isopycnal slopes exceed 0.01 (Danabasoglu & McWilliams 1995, J. Climate 8, 2967)
+function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 10, vertical_mixing = :catke, horizontal_mixing = :gm_redi)
     vertical_mixing in VERTICAL_MIXING || error("vertical_mixing must be one of $(VERTICAL_MIXING), got $(repr(vertical_mixing))")
-    horizontal = iszero(κ_horizontal) ? nothing : HorizontalScalarDiffusivity(κ = κ_horizontal)
+    horizontal_mixing in HORIZONTAL_MIXING || error("horizontal_mixing must be one of $(HORIZONTAL_MIXING), got $(repr(horizontal_mixing))")
+    horizontal = iszero(κ_horizontal) ? nothing :
+                 horizontal_mixing == :gm_redi ? IsopycnalSkewSymmetricDiffusivity(κ_skew = κ_horizontal, κ_symmetric = κ_horizontal) :    # Gent & McWilliams (1990), Redi (1982)
+                 HorizontalScalarDiffusivity(κ = κ_horizontal)
     mixing = vertical_mixing == :catke ? CATKEVerticalDiffusivity() :    # Wagner et al. (2025, JAMES 17, e2024MS004522)
              ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0)
     closures = (VerticalScalarDiffusivity(ν = prandtl * κ_vertical, κ = κ_vertical), horizontal, mixing)
@@ -133,6 +159,9 @@ end
 
 # A run's vertical mixing scheme from its parameter file; older files predate the option, when convective adjustment was the only one
 run_vertical_mixing(parameters) = Symbol(get(parameters["physics"], "vertical_mixing", "convective_adjustment"))
+
+# A run's horizontal mixing scheme; older files predate the option, when geopotential (level) diffusion was the only one
+run_horizontal_mixing(parameters) = Symbol(get(parameters["physics"], "horizontal_mixing", "horizontal"))
 
 # A run's background Prandtl number from its parameter file; older files set the viscosity directly
 function run_prandtl(parameters)
@@ -295,6 +324,9 @@ end
 
 is_finished(name) = isfile(parameter_file(name)) && haskey(read_parameters(name), "finished")
 
+# A finished run that stopped on a NaN (older files recorded those as "equilibrium" with a NaN model_time)
+blew_up(name) = is_finished(name) && (f = read_parameters(name)["finished"]; f["stopped_by"] == "nan" || !isfinite(f["model_time"]))
+
 # Latest checkpoint <name>_iteration<N>.jld2 of a run
 function latest_checkpoint(name)
     dir = joinpath(directory, "checkpoints")
@@ -455,7 +487,10 @@ Keywords:
 - `n_depth`, `use_GPU`: number of vertical levels and architecture.
 - `vertical_stretching`: thickness ratio of adjacent vertical cells (√1.2 with 2× `n_depth` halves every default cell).
 - `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
-- `κ_horizontal`: horizontal horizontal tracer diffusivity (0 for none).
+- `κ_horizontal`: horizontal tracer diffusivity (m²/s; 0 for none), or with GM-Redi both its eddy-thickness and isopycnal diffusivities.
+- `horizontal_mixing`: `:gm_redi` (default; Gent & McWilliams 1990 eddy advection plus Redi 1982 diffusion along isopycnals, slopes
+  above 0.01 tapered) or `:horizontal` (diffusion along level surfaces, which mixes across sloping isotherms). A restart keeps its
+  run's scheme (`:horizontal` for runs that predate the option), so leave it as `nothing` or pass the same one.
 - `κ_vertical`: background vertical tracer diffusivity (m²/s).
 - `prandtl`: background Prandtl number, so the background vertical viscosity is `prandtl × κ_vertical` (default 10, as in the
   Pacanowski & Philander 1981 and KPP backgrounds). A restart keeps its run's value (ν/κ for runs that set ν directly), so leave it as
@@ -467,6 +502,9 @@ Keywords:
   surface pressure `surface_pressure` (bar). The wind file is solved by `src/climate/climate_emulator.py` (Python env `\$EXO_EMULATOR_PYTHON`)
   and cached in `\$EXO_OCEAN_OUTPUT/winds/`; errors if no planet matches. Uses the ExoCAM emulator and the nearby M-dwarf mean [Fe/H];
   `wind_stress_scale` multiplies the stress.
+- `wind_current_coupling`: s_w, how far the emulator's wind follows the ocean surface current (Renault et al. 2016, JPO 46, 1685, eq. 19;
+  2020, JAMES 12, e2019MS001715). The stress uses the wind relative to (1 − s_w) × the top-cell current: 1 (default) ignores the
+  current (absolute wind), 0 uses the full relative wind, and 0.3 is Renault et al. (2020)'s global mean for a forced ocean.
 - `salinity`: carry a passive salinity tracer initialised to this value (`nothing`: temperature only).
 - `cfl`, `max_Δt`: advective CFL target and timestep cap (inertial stability).
 - `restart`: name of a run to continue from its latest checkpoint for a further `simulation_time` (`simulation_name` must be the same).
@@ -484,9 +522,9 @@ Keywords:
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
                           resolution = 1.0, max_lat = 80, n_depth = 20,
                           use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
-                          κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing,
+                          κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing, horizontal_mixing = nothing,
                           wind_field = nothing, salinity = nothing,
-                          emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0,
+                          emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0, wind_current_coupling = 1.0,
                           cfl = 0.2, max_Δt = nothing,
                           restart = nothing, resume = false, warm_start = nothing,
                           equilibrium_tol = nothing, equilibrium_window = 10 * 365days,
@@ -510,12 +548,17 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         isnothing(vertical_mixing) || Symbol(vertical_mixing) == run_mixing ||
             error("$(restart) ran with vertical_mixing = :$(run_mixing), so it can't continue with :$(vertical_mixing)")
         vertical_mixing = run_mixing
+        run_horizontal = run_horizontal_mixing(restart_parameters)
+        isnothing(horizontal_mixing) || Symbol(horizontal_mixing) == run_horizontal ||
+            error("$(restart) ran with horizontal_mixing = :$(run_horizontal), so it can't continue with :$(horizontal_mixing)")
+        horizontal_mixing = run_horizontal
         run_pr = run_prandtl(restart_parameters)
         isnothing(prandtl) || isapprox(prandtl, run_pr; rtol = 1e-6) ||
             error("$(restart) ran with prandtl = $(run_pr), so it can't continue with $(prandtl)")
         prandtl = run_pr
     end
     vertical_mixing = Symbol(something(vertical_mixing, :catke))
+    horizontal_mixing = Symbol(something(horizontal_mixing, :gm_redi))
     prandtl = Float64(something(prandtl, 10))
     ν_vertical = prandtl * κ_vertical
     max_Δt = something(max_Δt, default_max_Δt(rotational_period, max_lat))
@@ -528,12 +571,13 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         rotational_period > 0 || error("emulator_wind needs a rotating, tidally locked planet (rotational_period > 0)")
         wind_file = emulator_wind_file(rotational_period, T_day, T_night, surface_pressure)
     end
+    wind_current_coupling == 1 || emulator_wind || error("wind_current_coupling needs emulator_wind = true")
 
     # Sets up model settings
     arch = select_architecture(use_GPU)
     momentum = WENOVectorInvariant(order = 5)
     tracers_adv = WENO(order = 5)
-    closure = ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing)
+    closure = ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing, horizontal_mixing)
     halo = required_halo(momentum, tracers_adv, closure)
     grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching, max_lat)
 
@@ -541,7 +585,9 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     eos = LinearEquationOfState(thermal_expansion = 2e-4, haline_contraction = 0.0)
     buoyancy = isnothing(salinity) ? SeawaterBuoyancy(equation_of_state = eos, constant_salinity = 35.0) : SeawaterBuoyancy(equation_of_state = eos)
 
-    wind_stress = isnothing(wind_file) ? nothing : emulator_wind_stress(wind_file, grid; P_rot = rotational_period, scale = wind_stress_scale)
+    wind_stress = isnothing(wind_file) ? nothing :
+                  wind_current_coupling == 1 ? emulator_wind_stress(wind_file, grid; P_rot = rotational_period, scale = wind_stress_scale) :
+                  emulator_current_feedback(wind_file, grid, wind_current_coupling; P_rot = rotational_period, scale = wind_stress_scale)
     u_bcs, v_bcs = velocity_boundary_conditions(wind_field, wind_stress)
     relaxation = (; T_day, T_night, W = Q_surface / (rho_seawater * cp_seawater))
     T_bcs = FieldBoundaryConditions(top = FluxBoundaryCondition(surface_relaxation, discrete_form = true, parameters = relaxation))
@@ -575,8 +621,9 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
 
     if !isnothing(warm_start) && !regrid
         @info "Warm-starting from $(latest_checkpoint(warm_start)) on the same grid"
-        new_closure = run_vertical_mixing(donor_parameters) != vertical_mixing    # the new scheme starts its own TKE and diffusivities
-        restore_checkpoint!(simulation, latest_checkpoint(warm_start); drop = (no_salinity..., (new_closure ? (:e,) : ())...),
+        new_vertical = run_vertical_mixing(donor_parameters) != vertical_mixing    # the new scheme starts its own TKE and diffusivities
+        new_closure = new_vertical || run_horizontal_mixing(donor_parameters) != horizontal_mixing
+        restore_checkpoint!(simulation, latest_checkpoint(warm_start); drop = (no_salinity..., (new_vertical ? (:e,) : ())...),
                             new_closure, reset_clock = true)
     end
 
@@ -585,9 +632,9 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             planet = (; rotational_period, ocean_depth, planet_radius, T_day, T_night),
             grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
                     z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
-            physics = (; κ_horizontal, κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
+            physics = (; κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
                        heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
-                       wind_file, wind_stress_scale),
+                       wind_file, wind_stress_scale, wind_current_coupling),
             time = (; simulation_time, cfl, max_Δt, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval),
             warm_start = (; donor = warm_start, regridded = regrid,
                           checkpoint = isnothing(warm_start) ? nothing : latest_checkpoint(warm_start))))
@@ -596,7 +643,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     equilibrium = isnothing(equilibrium_tol) ? nothing : equilibrium_check(equilibrium_tol, equilibrium_window, rho_seawater * cp_seawater * ocean_depth)
     simulation.callbacks[:progress] = Callback(progress_callback(model, surface_heat_flux(model, relaxation), equilibrium), IterationInterval(100))
     simulation.callbacks[:wizard] = Callback(TimeStepWizard(; cfl, max_change = 1.05, max_Δt), IterationInterval(10))
-    global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale)
+    global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale, wind_current_coupling)
     add_output_writers!(simulation, simulation_name; output_interval, snapshot_interval, checkpoint_interval, global_attributes,
                         append = !isnothing(restart))
 
@@ -614,9 +661,15 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     end
 
     @info "Simulation setup complete. Starting the run..."
-    run!(simulation, checkpoint_at_end = !isnothing(checkpoint_interval))
-    write_final_snapshot!(simulation)
+    run!(simulation)
     t = simulation.model.clock.time
+    if !isfinite(t) || hasnan(model.velocities.u) || hasnan(model.tracers.T)    # the NaN checker stopped it; keep the last good checkpoint
+        record_finished!(simulation_name, Float64(t), "nan")
+        @error "$(simulation_name) blew up (NaN) at $(prettytime(t)); its latest checkpoint is $(has_checkpoint(simulation_name) ? latest_checkpoint(simulation_name) : "none")"
+        return nothing
+    end
+    isnothing(checkpoint_interval) || Oceananigans.OutputWriters.checkpoint(simulation)
+    write_final_snapshot!(simulation)
     record_finished!(simulation_name, Float64(t), t >= simulation.stop_time ? "stop_time" : "equilibrium")
     @info "Simulation finished successfully!"
 

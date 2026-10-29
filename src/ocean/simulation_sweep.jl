@@ -32,7 +32,8 @@ function simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_
     planet_radius = get(params, :planet_radius, R_Earth)
 
     function launch(name, p, from)
-        is_finished(name) && return @info("Skipping $(name): already finished")
+        is_finished(name) && return blew_up(name) ? @error("Skipping $(name): it blew up (NaN)") : @info("Skipping $(name): already finished")
+        !isnothing(from) && blew_up(from) && return @error("Skipping $(name): its warm start $(from) blew up (NaN)")
         resume = has_checkpoint(name) && isfile(parameter_file(name))
         resume && (check_same_grid(name, p); @info("Resuming $(name) from its latest checkpoint"))
         ocean_simulation(name, p.rotational_period, p.ocean_depth, planet_radius, p.T_day, p.T_night, get(p, :simulation_time, MAIN_TIME);
@@ -64,7 +65,8 @@ end
 # How a swept value appears in a run name, as (before, after) the value: P10, nu1e-5, 0.5deg, wind3bar
 const NAME_TAGS = Dict(:rotational_period => ("P", ""), :T_day => ("Tday", ""), :T_night => ("Tnight", ""), :ocean_depth => ("D", "m"),
                        :resolution => ("", "deg"), :n_depth => ("nz", ""), :prandtl => ("Pr", ""), :κ_vertical => ("kv", ""),
-                       :κ_horizontal => ("kh", ""), :surface_pressure => ("wind", "bar"), :vertical_mixing => ("", ""))
+                       :κ_horizontal => ("kh", ""), :surface_pressure => ("wind", "bar"), :vertical_mixing => ("", ""),
+                       :horizontal_mixing => ("", ""), :wind_current_coupling => ("sw", ""))
 compact(x::Real) = isinteger(x) ? string(Int(x)) : abs(x) < 0.01 ? replace(@sprintf("%.0e", x), "e-0" => "e-") : string(x)
 compact(x) = string(x)
 name_tag(key, value) = ((before, after) = get(NAME_TAGS, key, (String(key), "")); before * compact(value) * after)

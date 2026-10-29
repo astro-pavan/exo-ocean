@@ -79,44 +79,77 @@ function neutral_10m_speed(W, z)
     return U₁₀
 end
 
+# Equivalent neutral 10 m wind vector (U₁₀x, U₁₀y) and air density at λ, φ: the lowest-level wind U turned into a 10 m speed U₁₀ along U
+function emulator_10m_wind(fields, attrs, λ, φ)
+    lon, lat, u, v, ρa = fields
+    U = bilinear_periodic(u, lon, lat, λ, φ)
+    V = bilinear_periodic(v, lon, lat, λ, φ)
+    ρ = bilinear_periodic(ρa, lon, lat, λ, φ)
+    W = sqrt(U^2 + V^2)
+    W > 0 || return zero(W), zero(W), ρ
+    U₁₀ = neutral_10m_speed(W, lowest_level_height(attrs["P0_bar"], ρ, attrs["gravity_m_s2"]))
+    return U₁₀ * U / W, U₁₀ * V / W, ρ
+end
+
+function read_emulator_wind(path; P_rot = nothing)
+    fields, attrs = NCDataset(path) do ds
+        haskey(ds, "rho_air") && ndims(ds["u_0"]) == 2 || error("$(basename(path)) is not a single-planet wind file; regenerate it with src/climate/climate_emulator.py")
+        (Float64.(ds["lon"][:]), Float64.(ds["lat"][:]), Float64.(ds["u_0"][:, :]), Float64.(ds["v_0"][:, :]), Float64.(ds["rho_air"][:, :])),
+        Dict(ds.attrib)
+    end                                                                          # fields are (lon, lat)
+    isnothing(P_rot) || isapprox(P_rot, attrs["P_rot_days"]; rtol=1e-3) || @warn "$(basename(path)) is for P_rot = $(attrs["P_rot_days"]) d, not $(P_rot) d"
+    return fields, attrs
+end
+
+# Kinematic top flux of one stress component (−τ/ρ₀) from the wind (Ux, Uy) the surface sees, of which U is that component
+@inline bulk_stress(Ux, Uy, ρ, U, scale) = -scale * ρ * large_yeager_CD(sqrt(Ux^2 + Uy^2)) * sqrt(Ux^2 + Uy^2) * U / rho_seawater
+
+# (U₁₀x, U₁₀y, ρ_air) arrays at u-points (Nx, Ny) and at v-points (Nx, Ny+1) on the CPU
+function emulator_10m_wind_arrays(fields, attrs, grid)
+    cpu_grid = on_architecture(CPU(), grid)
+    at(λs, φs) = (w = [emulator_10m_wind(fields, attrs, λ, φ) for λ in λs, φ in φs]; (getindex.(w, 1), getindex.(w, 2), getindex.(w, 3)))
+    return at(λnodes(cpu_grid, Face()), φnodes(cpu_grid, Center())), at(λnodes(cpu_grid, Center()), φnodes(cpu_grid, Face()))
+end
+
 # Kinematic surface stress (τx, τy) / ρ₀ at u- and v-points for `ocean_simulation(...; wind_stress)`: τ = ρ_air C_D(U₁₀) U₁₀² along the
 # lowest-level wind U, with U₁₀ the equivalent neutral 10 m speed shifted down from the lowest level's height, signed as wind_stress_u/v in
 # ocean_sim.jl. Pass `P_rot` (days) to check the file; `scale` multiplies the stress.
 function emulator_wind_stress(path, grid; P_rot = nothing, scale = 1)
-    lon, lat, u, v, ρa, attrs = NCDataset(path) do ds
-        haskey(ds, "rho_air") && ndims(ds["u_0"]) == 2 || error("$(basename(path)) is not a single-planet wind file; regenerate it with src/climate/climate_emulator.py")
-        Float64.(ds["lon"][:]), Float64.(ds["lat"][:]), Float64.(ds["u_0"][:, :]), Float64.(ds["v_0"][:, :]), Float64.(ds["rho_air"][:, :]),
-        Dict(ds.attrib)
-    end                                                                          # fields are (lon, lat)
-    isnothing(P_rot) || isapprox(P_rot, attrs["P_rot_days"]; rtol=1e-3) || @warn "$(basename(path)) is for P_rot = $(attrs["P_rot_days"]) d, not $(P_rot) d"
-
-    function stress(λ, φ, component)
-        U = bilinear_periodic(u, lon, lat, λ, φ)
-        V = bilinear_periodic(v, lon, lat, λ, φ)
-        ρ = bilinear_periodic(ρa, lon, lat, λ, φ)
-        W = sqrt(U^2 + V^2)
-        W > 0 || return zero(W)
-        U₁₀ = neutral_10m_speed(W, lowest_level_height(attrs["P0_bar"], ρ, attrs["gravity_m_s2"]))
-        return -scale * ρ * large_yeager_CD(U₁₀) * U₁₀^2 * (component == :x ? U : V) / W / rho_seawater
-    end
-
-    cpu_grid = on_architecture(CPU(), grid)
-    τx = [stress(λ, φ, :x) for λ in λnodes(cpu_grid, Face()), φ in φnodes(cpu_grid, Center())]    # (Nx, Ny) at u-points
-    τy = [stress(λ, φ, :y) for λ in λnodes(cpu_grid, Center()), φ in φnodes(cpu_grid, Face())]    # (Nx, Ny+1) at v-points
-    @info "Emulator wind stress from $(basename(path)) (P_rot = $(attrs["P_rot_days"]) d, P0 = $(attrs["P0_bar"]) bar, " *
-          "T_star = $(round(Int, attrs["T_star_K"])) K, F_star = $(round(Int, attrs["F_star_W_m2"])) W/m², CO2 = $(round(attrs["CO2"], sigdigits=3))): " *
-          "max |τ| = $(round(rho_seawater * maximum(hypot.(τx, τy[:, 1:end-1])), sigdigits=3)) N/m², from winds at " *
-          "$(round(Int, lowest_level_height(attrs["P0_bar"], mean(ρa), attrs["gravity_m_s2"]))) m reduced to 10 m"
-
+    fields, attrs = read_emulator_wind(path; P_rot)
+    (Ux_u, Uy_u, ρ_u), (Ux_v, Uy_v, ρ_v) = emulator_10m_wind_arrays(fields, attrs, grid)
+    τx = bulk_stress.(Ux_u, Uy_u, ρ_u, Ux_u, scale)
+    τy = bulk_stress.(Ux_v, Uy_v, ρ_v, Uy_v, scale)
+    log_emulator_stress(path, attrs, fields, τx, τy)
     FT = eltype(grid)
     arch = architecture(grid)
     return on_architecture(arch, FT.(τx)), on_architecture(arch, FT.(τy))
 end
 
+function log_emulator_stress(path, attrs, fields, τx, τy)
+    @info "Emulator wind stress from $(basename(path)) (P_rot = $(attrs["P_rot_days"]) d, P0 = $(attrs["P0_bar"]) bar, " *
+          "T_star = $(round(Int, attrs["T_star_K"])) K, F_star = $(round(Int, attrs["F_star_W_m2"])) W/m², CO2 = $(round(attrs["CO2"], sigdigits=3))): " *
+          "max |τ| = $(round(rho_seawater * maximum(hypot.(τx, τy[:, 1:end-1])), sigdigits=3)) N/m² at rest, from winds at " *
+          "$(round(Int, lowest_level_height(attrs["P0_bar"], mean(fields[5]), attrs["gravity_m_s2"]))) m reduced to 10 m"
+end
+
+# Parameters of `current_feedback_stress_u/v`: the 10 m wind and air density at u- and v-points on the grid's architecture, the stress
+# scale and α = 1 − s_w, the fraction of the surface current the stress sees (Renault et al. 2020, JAMES 12, e2019MS001715, Table 1)
+function emulator_current_feedback(path, grid, wind_current_coupling; P_rot = nothing, scale = 1)
+    fields, attrs = read_emulator_wind(path; P_rot)
+    (Ux_u, Uy_u, ρ_u), (Ux_v, Uy_v, ρ_v) = emulator_10m_wind_arrays(fields, attrs, grid)
+    log_emulator_stress(path, attrs, fields, bulk_stress.(Ux_u, Uy_u, ρ_u, Ux_u, scale), bulk_stress.(Ux_v, Uy_v, ρ_v, Uy_v, scale))
+    @info "Current feedback: stress from the wind relative to (1 − s_w) × the surface current, s_w = $(wind_current_coupling)"
+    FT = eltype(grid)
+    on(a) = on_architecture(architecture(grid), FT.(a))
+    return (; Ux_u = on(Ux_u), Uy_u = on(Uy_u), ρ_u = on(ρ_u), Ux_v = on(Ux_v), Uy_v = on(Uy_v), ρ_v = on(ρ_v),
+            α = FT(1 - wind_current_coupling), scale = FT(scale))
+end
+
 # Emulator provenance for the ocean output's global attributes
-function emulator_attributes(path, scale)
+function emulator_attributes(path, scale, wind_current_coupling = 1)
     a = NCDataset(ds -> Dict(ds.attrib), path)
     keys_out = ("P0_bar", "M_star_Msun", "T_star_K", "F_star_W_m2", "CO2", "FeH", "GCM", "T_day_emu_C", "T_night_emu_C", "emulator")
-    return merge(Dict("emulator_wind_file" => path, "wind_stress_scale" => Float64(scale)),
+    return merge(Dict("emulator_wind_file" => path, "wind_stress_scale" => Float64(scale),
+                       "wind_current_coupling" => Float64(wind_current_coupling)),
                  Dict("emulator_" * k => a[k] for k in keys_out if haskey(a, k)))
 end

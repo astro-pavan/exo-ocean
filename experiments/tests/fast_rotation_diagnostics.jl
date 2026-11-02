@@ -80,6 +80,7 @@ end
 function install_recorder!(sim, name, config)
     model, grid = sim.model, sim.model.grid
     mkpath(DIAG_DIR)
+    record_every, budget_every = get(config, :record_every, 1), get(config, :budget_every, 10)    # budget_every must be a multiple of record_every
     Nx, Ny, Nz = size(grid)
     T, (u, v, w) = model.tracers.T, (model.velocities.u, model.velocities.v, model.velocities.w)
 
@@ -131,11 +132,11 @@ function install_recorder!(sim, name, config)
         w_polar = max(maximum(abs, view(interior(w), :, polar_south, :)), maximum(abs, view(interior(w), :, polar_north, :)))
         println(steps, join((i, t, sim.Δt, round(time() - wall₀, digits = 2), cfl, U, V, W, T_min, T_max, u_polar, w_polar), ","))
 
-        if i % 10 == 0
+        if i % budget_every == 0
             explicit = sum(weights .* Array(interior(model.timestepper.Gⁿ.T))) * heat_capacity    # tendencies before the implicit vertical solve
             println(budget, join((i, t, sim.Δt, sum(weights .* Array(interior(T))), heat_flux(), explicit, heat_capacity), ","))
         end
-        i % 100 == 0 && flush_rows!()
+        i % (record_every * (100 ÷ record_every)) == 0 && flush_rows!()
         config.frames || return nothing
 
         broken = !(isfinite(U) && isfinite(T_min) && isfinite(T_max))
@@ -161,7 +162,8 @@ function install_recorder!(sim, name, config)
         return nothing
     end
 
-    sim.callbacks[:recorder] = Callback(record, IterationInterval(1))
+    sim.callbacks[:recorder] = Callback(record, IterationInterval(record_every))
+    haskey(config, :setup) && config.setup(sim, name)    # test-specific changes to the built simulation
     return nothing
 end
 
@@ -214,13 +216,13 @@ const TESTS = [
 
 donor_of(P) = "res1km_P$(P)_dT30_spinup"
 
-function run_test(test_name, P, stage, changes; donor = donor_of(P), common = base)
+function run_test(test_name, P, stage, changes; donor = donor_of(P), common = base, recorder = (;))
     name = "fastdiag_$(test_name)"
     if !isnothing(donor) && !(is_finished(donor) && !blew_up(donor) && has_checkpoint(donor))
         return @error "Skipping $(name): $(donor) isn't a finished run with a checkpoint here"
     end
     params = merge(common, (; max_Δt = cap(P)), stage, changes, (; name, rotational_period = P))
-    RECORDER[] = (; rotational_period = P, params.T_day, params.T_night, frames = params.resolution < 2)
+    RECORDER[] = merge((; rotational_period = P, params.T_day, params.T_night, frames = params.resolution < 2), recorder)
     try
         simulation(params, nothing, donor)
     catch err

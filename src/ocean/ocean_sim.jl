@@ -142,6 +142,14 @@ end
 const VERTICAL_MIXING = (:catke, :convective_adjustment)
 const HORIZONTAL_MIXING = (:gm_redi, :horizontal)
 
+@inline function kappa_tidal(i, j, k, grid, clock, fields, p)
+    N² = p.gα * ∂zᶜᶜᶠ(i, j, k, grid, fields.T)
+    S² = shear²ᶜᶜᶠ(i, j, k, grid, fields.u, fields.v)
+    Ri = max(N², zero(N²)) / (S² + p.S²_min)
+    z = znode(i, j, k, grid, Center(), Center(), Face())
+    
+end
+
 # κ_horizontal = 0 omits the horizontal tracer diffusivity; vertical_mixing is added to the constant background of tracer diffusivity
 # κ_vertical and viscosity prandtl × κ_vertical. :gm_redi uses κ_horizontal as both the GM skew and the Redi isopycnal diffusivity,
 # tapered where isopycnal slopes exceed 0.01 (Danabasoglu & McWilliams 1995, J. Climate 8, 2967)
@@ -507,6 +515,7 @@ Keywords:
   current (absolute wind), 0 uses the full relative wind, and 0.3 is Renault et al. (2020)'s global mean for a forced ocean.
 - `salinity`: carry a passive salinity tracer initialised to this value (`nothing`: temperature only).
 - `cfl`, `max_Δt`: advective CFL target and timestep cap (inertial stability).
+- `free_surface_cfl`: barotropic wave CFL, which sets the number of free-surface substeps.
 - `restart`: name of a run to continue from its latest checkpoint for a further `simulation_time` (`simulation_name` must be the same).
   The grid comes from its parameter file (grid keywords and `ocean_depth` are ignored); the clock carries on and output is appended
   to its existing files. Other settings come from this call, so pass the same ones to continue the run unchanged.
@@ -525,7 +534,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                           κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing, horizontal_mixing = nothing,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0, wind_current_coupling = 1.0,
-                          cfl = 0.2, max_Δt = nothing,
+                          cfl = 0.2, max_Δt = nothing, free_surface_cfl = 0.7,
                           restart = nothing, resume = false, warm_start = nothing,
                           equilibrium_tol = nothing, equilibrium_window = 10 * 365days,
                           output_interval = 5 * 365days, snapshot_interval = 36.5days, checkpoint_interval = nothing)
@@ -599,7 +608,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                                         buoyancy,
                                         tracers = isnothing(salinity) ? (:T,) : (:T, :S),
                                         closure,
-                                        free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7, fixed_Δt = max_Δt),
+                                        free_surface = SplitExplicitFreeSurface(grid; cfl = free_surface_cfl, fixed_Δt = max_Δt),
                                         boundary_conditions = (; u = u_bcs, v = v_bcs, T = T_bcs)
                                         )
 
@@ -635,7 +644,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             physics = (; κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
                        heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
                        wind_file, wind_stress_scale, wind_current_coupling),
-            time = (; simulation_time, cfl, max_Δt, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval),
+            time = (; simulation_time, cfl, max_Δt, free_surface_cfl, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval),
             warm_start = (; donor = warm_start, regridded = regrid,
                           checkpoint = isnothing(warm_start) ? nothing : latest_checkpoint(warm_start))))
     end

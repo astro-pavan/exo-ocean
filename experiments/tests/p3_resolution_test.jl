@@ -1,6 +1,6 @@
 # What resolution does the sweep's fastest planet need as ΔT changes, and does the calculated Δt cap hold? P = 3 d, 1 km, no wind, ΔT = 1, 10 and 30 K.
 # See docs/LLM/resolution_timestep_requirements.md for the cap. In priority order, each warm-started from its own 2° state:
-#   spinup   2° to deep equilibrium for ΔT = 1 and 10 K; ΔT = 30 K uses the leak-free fastdiag_heat_P3_cap0.5
+#   spinup   2° to deep equilibrium for ΔT = 1 and 10 K; ΔT = 30 K uses the leak-free fastdiag_heat_P3_cap0.5, or spins up too if its checkpoint is missing
 #   1deg     10 yr at ΔT = 1, 10, 30 K: the first test of the cap at 1.42–1.74 h
 #   0.5deg   10 yr at ΔT = 1, 10, 30 K: convergence against 1°, and the first run of P3 past 1.45 yr at this resolution
 #   0.25deg  5 yr at ΔT = 1 K, the case most likely to need it
@@ -22,7 +22,7 @@ function Δt_cap(P, ΔT, resolution; max_lat = 80)
 end
 
 const P = 3
-const SPUN_UP = Dict(1.0 => "fastdiag_p3res_dT1_spinup", 10.0 => "fastdiag_p3res_dT10_spinup", 30.0 => "fastdiag_heat_P3_cap0.5")
+const EXISTING_SEEDS = Dict(30.0 => "fastdiag_heat_P3_cap0.5")
 
 spin_up(ΔT) = (; resolution = 2.0, simulation_time = 100 * 365days, equilibrium_tol = 0.001ΔT, equilibrium_window = 20 * 365days, checkpoint_interval = 10 * 365days)
 stage(resolution, years) = merge(fine(years), (; resolution))
@@ -31,23 +31,34 @@ sparse = (; frames = false, record_every = 70, budget_every = 70)    # the spin-
 routine = (; frames = false, record_every = 7, budget_every = 7)     # enough to see bursts, at little cost; a blow-up can be replayed from its yearly checkpoint
 
 label(ΔT) = "dT$(Int(ΔT))"
-spin_test(ΔT) = ("p3res_$(label(ΔT))_spinup", spin_up(ΔT), 2.0, sparse, nothing)
-main_test(ΔT, resolution, years) = ("p3res_$(label(ΔT))_$(resolution)deg", stage(resolution, years), resolution, routine, SPUN_UP[ΔT])
+common(ΔT) = merge(base, (; T_day = ΔT))
+usable_seed(name) = is_finished(name) && !blew_up(name) && has_checkpoint(name)
 
-const P3_TESTS = [
-    (1.0, spin_test(1.0)...), (10.0, spin_test(10.0)...),
-    (1.0, main_test(1.0, 1.0, 10)...), (10.0, main_test(10.0, 1.0, 10)...), (30.0, main_test(30.0, 1.0, 10)...),
-    (1.0, main_test(1.0, 0.5, 10)...), (10.0, main_test(10.0, 0.5, 10)...), (30.0, main_test(30.0, 0.5, 10)...),
-    (1.0, main_test(1.0, 0.25, 5)...),
-]
+# The 2° state to start from: an existing one if it's usable, otherwise a new spin-up from rest, otherwise rest itself, so that no test is skipped
+function seed_for(ΔT)
+    existing = get(EXISTING_SEEDS, ΔT, nothing)
+    !isnothing(existing) && usable_seed(existing) && return existing
+    isnothing(existing) || @warn "$(existing) has no usable checkpoint here, so spinning up ΔT = $(ΔT) K from rest"
+    test_name = "p3res_$(label(ΔT))_spinup"
+    run_test(test_name, P, spin_up(ΔT), (; max_Δt = Δt_cap(P, ΔT, 2.0)); donor = nothing, common = common(ΔT), recorder = sparse)
+    seed = "fastdiag_$(test_name)"
+    usable_seed(seed) && return seed
+    @warn "$(seed) has no usable checkpoint, so the ΔT = $(ΔT) K tests start from rest and won't reach equilibrium"
+    return nothing
+end
+
+# (ΔT, resolution, years)
+const P3_TESTS = [(1.0, 1.0, 10), (10.0, 1.0, 10), (30.0, 1.0, 10), (1.0, 0.5, 10), (10.0, 0.5, 10), (30.0, 0.5, 10), (1.0, 0.25, 5)]
+test_name(ΔT, resolution) = "p3res_$(label(ΔT))_$(resolution)deg"
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    chosen = isempty(ARGS) ? P3_TESTS : filter(t -> all(occursin(a, t[2]) for a in ARGS), P3_TESTS)
-    @info "Running $(length(chosen)) tests: $(join(getindex.(chosen, 2), ", "))"
-    for (ΔT, test_name, settings, resolution, recorder, donor) in chosen
+    chosen = isempty(ARGS) ? P3_TESTS : filter(t -> all(occursin(a, test_name(t[1], t[2])) for a in ARGS), P3_TESTS)
+    @info "Running $(length(chosen)) tests: $(join((test_name(t[1], t[2]) for t in chosen), ", "))"
+    seeds = Dict(ΔT => seed_for(ΔT) for ΔT in unique(first.(chosen)))
+    for (ΔT, resolution, years) in chosen
         max_Δt = Δt_cap(P, ΔT, resolution)
-        @info "$(test_name): Δt cap $(round(max_Δt / hour, digits = 2)) h"
-        run_test(test_name, P, settings, (; max_Δt); donor, common = merge(base, (; T_day = ΔT)), recorder)
+        @info "$(test_name(ΔT, resolution)): Δt cap $(round(max_Δt / hour, digits = 2)) h, starting from $(something(seeds[ΔT], "rest"))"
+        run_test(test_name(ΔT, resolution), P, stage(resolution, years), (; max_Δt); donor = seeds[ΔT], common = common(ΔT), recorder = routine)
     end
     @info "All tests done"
 end

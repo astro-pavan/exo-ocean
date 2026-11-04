@@ -13,7 +13,7 @@ if pgrep -f "julia.*(p3_resolution_test|fast_rotation_[a-z]*).jl" > /dev/null; t
 fi
 output="${EXO_OCEAN_OUTPUT:-output}"
 ls "$output"/checkpoints/fastdiag_heat_P3_cap0.5_iteration*.jld2 > /dev/null 2>&1 ||
-    echo "Warning: no fastdiag_heat_P3_cap0.5 checkpoint in $output/checkpoints; the ΔT = 30 K tests will be skipped"
+    echo "Note: no fastdiag_heat_P3_cap0.5 checkpoint in $output/checkpoints; ΔT = 30 K will spin up from rest first (up to ~6 h more)"
 echo "Free disk space for the output (these runs can reach ~10 GB):"; df -h "$output/" | tail -1
 
 mkdir -p logs

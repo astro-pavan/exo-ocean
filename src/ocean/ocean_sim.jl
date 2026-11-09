@@ -5,10 +5,11 @@ using Oceananigans.AbstractOperations: @at, Average
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.BoundaryConditions: fill_halo_regions!
 using Oceananigans.Diagnostics: AdvectiveCFL, hasnan
-using Oceananigans.Fields: interpolate
-using Oceananigans.Grids: λnode, φnode
-using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ
-using Oceananigans.TurbulenceClosures: IsopycnalSkewSymmetricDiffusivity
+using Oceananigans: UpdateStateCallsite
+using Oceananigans.Fields: interpolate, compute!
+using Oceananigans.Grids: λnode, φnode, znode
+using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ, ∂zᶜᶜᶠ
+using Oceananigans.TurbulenceClosures: IsopycnalSkewSymmetricDiffusivity, shear_squaredᶜᶜᶠ
 using NCDatasets
 using Statistics
 using TOML
@@ -141,19 +142,55 @@ end
 
 const VERTICAL_MIXING = (:catke, :convective_adjustment)
 const HORIZONTAL_MIXING = (:gm_redi, :horizontal)
+const THERMAL_EXPANSION = 2e-4    # 1/K
 
+@inline function tidal_dissipation(P_rotation, eccentricty, r_planet, Q) # from Shi et al. (2025) and Barnes et al. (2013)
+    return 0.02 * (P_rotation / 6.1) ^ -5 * (eccentricty / 0.005) ^ 2 * (r_planet / 0.92) ^ 3 * (Q / 84) ^ -1 # W / m^2
+end
+
+# Parameters of kappa_tidal, fixed for a run. ϵ0 normalises the profile so ∫ρϵ dh = tidal_fraction × D over the column (Polzin 2009, Ocean Modelling 30, 298)
+function tidal_parameters(; rotational_period, ocean_depth, planet_radius, eccentricity, Q = 84, fraction = 0.3, z_p = 500, Γ = :constant, prandtl = 1, κ_max = 0.1)
+    rotational_period > 0 || error("tidal mixing needs a synchronously rotating planet (rotational_period > 0)")
+    Γ in (:constant, :richardson) || error("tidal Γ must be :constant or :richardson, got $(repr(Γ))")
+    D = tidal_dissipation(rotational_period, eccentricity, planet_radius / R_Earth, Q)
+    ϵ0 = fraction * D * (1 / ocean_depth + 1 / z_p) / rho_seawater
+    return (; gα = g_Earth * THERMAL_EXPANSION, H = Float64(ocean_depth), z_p = Float64(z_p), ϵ0, Γ0 = 0.2, Ri_crt = 0.25, Ri_dependent = Γ == :richardson,
+            prandtl = Float64(prandtl), κ_max = Float64(κ_max), S²_min = 1e-20, N²_min = 1e-8)
+end
+
+# Osborn (1980) κ = Γϵ/N² with a bottom-decaying dissipation; z_p = Inf gives a uniform ϵ. Smooth through N² = 0 (→ κ_max there) so it can't switch on and off
 @inline function kappa_tidal(i, j, k, grid, clock, fields, p)
-    N² = p.gα * ∂zᶜᶜᶠ(i, j, k, grid, fields.T)
-    S² = shear²ᶜᶜᶠ(i, j, k, grid, fields.u, fields.v)
-    Ri = max(N², zero(N²)) / (S² + p.S²_min)
+    N² = max(p.gα * ∂zᶜᶜᶠ(i, j, k, grid, fields.T), 0)
+    S² = shear_squaredᶜᶜᶠ(i, j, k, grid, fields)
+    Ri = max(N² / (S² + p.S²_min), p.Ri_crt)    # Γ(Ri) held at its peak Γ0 below Ri_crt, else κ would jump from 0 to κ_max as N² → 0
     z = znode(i, j, k, grid, Center(), Center(), Face())
-    
+    h = z + p.H    # height above the seafloor
+
+    ϵ = p.ϵ0 / ((1 + h / p.z_p) ^ 2)
+    Γ = ifelse(p.Ri_dependent, 2 * p.Γ0 * sqrt(Ri / p.Ri_crt) / (1 + Ri / p.Ri_crt), p.Γ0)
+
+    κ = Γ * ϵ / (N² + p.N²_min)
+    return κ * p.κ_max / (κ + p.κ_max)    # harmonic cap, smooth unlike min
+end
+
+# The closure reads κ stored before each step: computed on the fly, it would see T and u that the implicit solve overwrites in place as it goes
+@inline kappa_tidal_stored(i, j, k, grid, clock, fields, p) = @inbounds p.κ[i, j, k]
+@inline viscosity_tidal_stored(i, j, k, grid, clock, fields, p) = @inbounds p.prandtl * p.κ[i, j, k]
+
+# Refresh the stored tidal κ from the current state, before each step's tendencies and implicit solve
+function add_tidal_κ_callback!(simulation, tidal, tidal_κ)
+    model = simulation.model
+    operation = KernelFunctionOperation{Center, Center, Face}(kappa_tidal, model.grid, model.clock, (; model.velocities.u, model.velocities.v, model.tracers.T), tidal)
+    κ_computed = Field(operation; data = tidal_κ.data)
+    compute!(κ_computed)
+    simulation.callbacks[:tidal_κ] = Callback(_ -> compute!(κ_computed), callsite = UpdateStateCallsite())
+    return nothing
 end
 
 # κ_horizontal = 0 omits the horizontal tracer diffusivity; vertical_mixing is added to the constant background of tracer diffusivity
 # κ_vertical and viscosity prandtl × κ_vertical. :gm_redi uses κ_horizontal as both the GM skew and the Redi isopycnal diffusivity,
 # tapered where isopycnal slopes exceed 0.01 (Danabasoglu & McWilliams 1995, J. Climate 8, 2967)
-function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 10, vertical_mixing = :catke, horizontal_mixing = :gm_redi)
+function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 10, vertical_mixing = :catke, horizontal_mixing = :gm_redi, tidal = nothing)
     vertical_mixing in VERTICAL_MIXING || error("vertical_mixing must be one of $(VERTICAL_MIXING), got $(repr(vertical_mixing))")
     horizontal_mixing in HORIZONTAL_MIXING || error("horizontal_mixing must be one of $(HORIZONTAL_MIXING), got $(repr(horizontal_mixing))")
     horizontal = iszero(κ_horizontal) ? nothing :
@@ -161,7 +198,9 @@ function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 10, vertic
                  HorizontalScalarDiffusivity(κ = κ_horizontal)
     mixing = vertical_mixing == :catke ? CATKEVerticalDiffusivity() :    # Wagner et al. (2025, JAMES 17, e2024MS004522)
              ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0)
-    closures = (VerticalScalarDiffusivity(ν = prandtl * κ_vertical, κ = κ_vertical), horizontal, mixing)
+    tidal_mixing = isnothing(tidal) ? nothing : VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); κ = kappa_tidal_stored, ν = viscosity_tidal_stored,
+                                                                                         discrete_form = true, loc = (Center, Center, Face), parameters = tidal)
+    closures = (VerticalScalarDiffusivity(ν = prandtl * κ_vertical, κ = κ_vertical), tidal_mixing, horizontal, mixing)
     return Tuple(c for c in closures if !isnothing(c))
 end
 
@@ -171,10 +210,30 @@ run_vertical_mixing(parameters) = Symbol(get(parameters["physics"], "vertical_mi
 # A run's horizontal mixing scheme; older files predate the option, when geopotential (level) diffusion was the only one
 run_horizontal_mixing(parameters) = Symbol(get(parameters["physics"], "horizontal_mixing", "horizontal"))
 
+# Whether a run has tidal mixing, which adds a closure to the tuple; older files predate the option
+run_tidal(parameters) = get(parameters["physics"], "tidal_eccentricity", "nothing") != "nothing"
+
+# A run's tidal_parameters from its parameter file, or nothing if it has no tidal mixing
+function run_tidal_parameters(parameters)
+    run_tidal(parameters) || return nothing
+    physics, planet = parameters["physics"], parameters["planet"]
+    return tidal_parameters(; rotational_period = planet["rotational_period"], ocean_depth = planet["ocean_depth"], planet_radius = planet["planet_radius"],
+                            eccentricity = physics["tidal_eccentricity"], Q = physics["tidal_Q"], fraction = physics["tidal_fraction"], z_p = physics["tidal_z_p"],
+                            Γ = Symbol(physics["tidal_Γ"]), prandtl = physics["tidal_prandtl"], κ_max = physics["tidal_κ_max"])
+end
+
 # A run's background Prandtl number from its parameter file; older files set the viscosity directly
 function run_prandtl(parameters)
     p = parameters["physics"]
     return haskey(p, "prandtl") ? Float64(p["prandtl"]) : p["ν_vertical"] / p["κ_vertical"]
+end
+
+# Momentum and tracer advection schemes; third-order upwind (Leonard 1979, CMAME 19, 59) adds spurious mixing (Marchesiello et al. 2009, Ocean Modelling 26, 156)
+function advection_schemes(advection)
+    advection == :weno5 && return WENOVectorInvariant(order = 5), WENO(order = 5)
+    advection == :upwind3 || error("advection must be :weno5 or :upwind3, got $(repr(advection))")
+    upwind = UpwindBiased(order = 3)
+    return VectorInvariant(vorticity_scheme = upwind, vertical_advection_scheme = upwind, divergence_scheme = upwind), upwind
 end
 
 # Smallest grid halo (at least 3) the schemes and closures need, checked on a small CPU grid of the same type
@@ -193,6 +252,17 @@ end
 #####
 ##### Warm starts
 #####
+
+# Set T, u, v from the last 3D snapshot of a run on the same grid, for a donor with no checkpoint
+function set_from_snapshot!(model, name)
+    NCDataset(joinpath(directory, "$(name).nc")) do ds
+        n = size(ds["T"], 4)
+        set!(model.tracers.T, Array(ds["T"][:, :, :, n]))
+        set!(model.velocities.u, Array(ds["u"][:, :, :, n]))
+        set!(model.velocities.v, Array(ds["v"][:, :, :, n]))
+    end
+    return nothing
+end
 
 # Remove `key` from every NamedTuple in a loaded checkpoint state (e.g. :S for a model without salinity)
 drop_state_key(x, key) = x
@@ -213,13 +283,14 @@ function restore_checkpoint!(simulation, path; drop, new_closure = false, reset_
     return nothing
 end
 
-# Warm start from a checkpoint on another grid, described by the donor run's parameter file (see `read_parameters`).
+# Warm start from a checkpoint or a run's 3D snapshot file on another grid, described by the donor run's parameter file (see `read_parameters`).
 # T, u, v are interpolated; below a shallower donor's floor u = v = 0 and T continues the donor's thermocline exponentially.
-function regrid_warm_start!(model, checkpoint, donor_parameters; planet_radius, T_night = 0.0)
+function regrid_warm_start!(model, source, donor_parameters; planet_radius, T_night = 0.0)
     donor = donor_grid(donor_parameters)
-    m = Oceananigans.OutputWriters.load_checkpoint_state(checkpoint).model
-    saved = size(parent(m.tracers.T.data))
-    halo = something(donor.halo, (saved .- (donor.n_lon, donor.n_lat, donor.n_depth)) .÷ 2)    # older parameter files have no halo
+    from_snapshot = endswith(source, ".nc")
+    m = from_snapshot ? nothing : Oceananigans.OutputWriters.load_checkpoint_state(source).model
+    saved = from_snapshot ? nothing : size(parent(m.tracers.T.data))
+    halo = from_snapshot ? something(donor.halo, (4, 4, 3)) : something(donor.halo, (saved .- (donor.n_lon, donor.n_lat, donor.n_depth)) .÷ 2)    # older parameter files have no halo
     all(halo .> 0) || error("the donor grid $(donor) doesn't match the checkpoint (T is $(saved) with halos)")
 
     src = ocean_grid(CPU(); donor.n_lon, donor.n_lat, donor.n_depth, donor.ocean_depth, planet_radius, halo,
@@ -227,11 +298,23 @@ function regrid_warm_start!(model, checkpoint, donor_parameters; planet_radius, 
     dst = on_architecture(CPU(), model.grid)
 
     T_src, u_src, v_src = CenterField(src), XFaceField(src), YFaceField(src)
-    for (f, saved, name) in ((T_src, m.tracers.T, :T), (u_src, m.velocities.u, :u), (v_src, m.velocities.v, :v))
-        data = Array(parent(saved.data))
-        size(data) == size(parent(f)) || error("the donor grid $(donor) doesn't match the checkpoint ($(name) is $(size(data)) with halos, expected $(size(parent(f))))")
-        copyto!(parent(f), data)
-        fill_halo_regions!(f)
+    if from_snapshot
+        NCDataset(source) do ds
+            n = size(ds["T"], 4)
+            for (f, name) in ((T_src, "T"), (u_src, "u"), (v_src, "v"))
+                data = Array(ds[name][:, :, :, n])
+                size(data) == size(interior(f)) || error("the donor grid $(donor) doesn't match $(source) ($(name) is $(size(data)), expected $(size(interior(f))))")
+                interior(f) .= data
+                fill_halo_regions!(f)
+            end
+        end
+    else
+        for (f, saved, name) in ((T_src, m.tracers.T, :T), (u_src, m.velocities.u, :u), (v_src, m.velocities.v, :v))
+            data = Array(parent(saved.data))
+            size(data) == size(parent(f)) || error("the donor grid $(donor) doesn't match the checkpoint ($(name) is $(size(data)) with halos, expected $(size(parent(f))))")
+            copyto!(parent(f), data)
+            fill_halo_regions!(f)
+        end
     end
 
     T = regrid_to(dst, T_src, (Center(), Center(), Center()))
@@ -346,6 +429,89 @@ end
 has_checkpoint(name) = isdir(joinpath(directory, "checkpoints")) &&
                        any(f -> occursin(Regex("^\\Q$(name)\\E_iteration\\d+\\.jld2\$"), f), readdir(joinpath(directory, "checkpoints")))
 
+# What a run can be warm-started from: its latest checkpoint, or else its 3D snapshot file, whose last frame holds the final state
+function warm_start_source(name)
+    has_checkpoint(name) && return latest_checkpoint(name)
+    path = joinpath(directory, "$(name).nc")
+    isfile(path) || error("$(name) has neither a checkpoint nor a 3D snapshot file")
+    return path
+end
+
+function remove_checkpoints!(name)
+    dir = joinpath(directory, "checkpoints")
+    isdir(dir) || return nothing
+    foreach(f -> occursin(Regex("^\\Q$(name)\\E_iteration\\d+\\.jld2\$"), f) && rm(joinpath(dir, f)), readdir(dir))
+    return nothing
+end
+
+#####
+##### Output compression
+#####
+
+# Copy a NetCDF dataset or group, deflating and byte-shuffling its float fields of two or more dimensions
+function copy_compressed!(src, dst; deflatelevel)
+    foreach(((k, v),) -> dst.attrib[k] = v, src.attrib)
+    unlimited = NCDatasets.unlimited(src.dim)
+    foreach(((name, len),) -> defDim(dst, name, name in unlimited ? Inf : len), src.dim)
+    for name in keys(src)
+        v = src[name].var
+        dims = NCDatasets.dimnames(v)
+        compress = ndims(v) >= 2 && eltype(v) <: AbstractFloat
+        by_frame = compress && last(dims) in unlimited
+        options = compress ? (; deflatelevel, shuffle = true) : (;)
+        by_frame && (options = merge(options, (; chunksizes = (size(v)[1:end-1]..., 1))))
+        out = defVar(dst, name, eltype(v), dims; attrib = collect(v.attrib), options...).var
+        if by_frame
+            for n in 1:size(v, ndims(v))
+                out[ntuple(_ -> :, ndims(v) - 1)..., n] = v[ntuple(_ -> :, ndims(v) - 1)..., n]
+            end
+        elseif ndims(v) == 0
+            out[] = v[]
+        else
+            ranges = map(n -> 1:n, size(v))
+            out[ranges...] = v[ranges...]
+        end
+    end
+    for name in keys(src.group)
+        copy_compressed!(src.group[name], defGroup(dst, name); deflatelevel)
+    end
+    return nothing
+end
+
+# Replace a finished NetCDF file with a compressed copy, only after checking the copy's last frame of T; a failure leaves the original
+function compress_netcdf!(path; deflatelevel = 1)
+    copy_path = path * ".compressing"
+    try
+        NCDataset(path) do src
+            NCDataset(copy_path, "c") do dst
+                copy_compressed!(src, dst; deflatelevel)
+            end
+        end
+        same = NCDataset(path) do a
+            NCDataset(copy_path) do b
+                n = size(a["T"], ndims(a["T"]))
+                size(a["T"]) == size(b["T"]) && isequal(a["T"].var[ntuple(_ -> :, ndims(a["T"]) - 1)..., n], b["T"].var[ntuple(_ -> :, ndims(b["T"]) - 1)..., n])
+            end
+        end
+        same || error("the compressed copy differs from the original")
+        before, after = filesize(path), filesize(copy_path)
+        mv(copy_path, path; force = true)
+        @info "Compressed $(basename(path)): $(round(before / 1e6, digits = 1)) → $(round(after / 1e6, digits = 1)) MB"
+    catch err
+        @warn "Couldn't compress $(path); keeping the original" exception = err
+        isfile(copy_path) && rm(copy_path)
+    end
+    return nothing
+end
+
+function compress_run_output!(simulation, name)
+    for key in (:full_3d, :section, :surface)
+        haskey(simulation.output_writers, key) && try close(simulation.output_writers[key]) catch end    # release the file before replacing it
+    end
+    foreach(suffix -> (path = joinpath(directory, "$(name)$(suffix).nc"); isfile(path) && compress_netcdf!(path)), ("", "_section", "_surface"))
+    return nothing
+end
+
 # Model time (s) a run is meant to reach: the end of its last restart, or else its original simulation_time
 function planned_end(p)
     restarts = get(p, "restarts", Any[])
@@ -438,7 +604,12 @@ function progress_callback(model, heat_flux, equilibrium)
 end
 
 # append = true continues a restarted run's existing files
-function add_output_writers!(simulation, name; output_interval, snapshot_interval, checkpoint_interval, global_attributes = Dict(), append = false)
+# Output at multiples of `interval` back from the end `t_end`, over the last `window` of model time
+last_times(interval, t_end, window) = [t_end - n * interval for n in floor(Int, window / interval):-1:0 if t_end - n * interval > 0]
+writer_schedule(interval, save_times) = isnothing(save_times) ? TimeInterval(interval) : SpecifiedTimes(last_times(interval, save_times...))
+
+# save_times = (end of the run, window): keep the 3D and surface output for that window only; the small zonal-mean `_section` file covers the whole run
+function add_output_writers!(simulation, name; output_interval, snapshot_interval, checkpoint_interval, global_attributes = Dict(), append = false, save_times = nothing)
     model = simulation.model
     ocean_dir = joinpath(directory)
     mkpath(ocean_dir)
@@ -446,7 +617,7 @@ function add_output_writers!(simulation, name; output_interval, snapshot_interva
 
     if !isnothing(output_interval)
         simulation.output_writers[:full_3d] = NetCDFWriter(model, fields; filename = joinpath(ocean_dir, "$(name).nc"),
-                                                           schedule = TimeInterval(output_interval), overwrite_existing = !append, global_attributes)
+                                                           schedule = writer_schedule(output_interval, save_times), overwrite_existing = !append, global_attributes)
     end
 
     if !isnothing(snapshot_interval)
@@ -456,7 +627,7 @@ function add_output_writers!(simulation, name; output_interval, snapshot_interva
                                                            schedule = TimeInterval(snapshot_interval), overwrite_existing = !append, global_attributes)
         # top cell (lat × lon); w on the top cell's lower face. The writer slices, so the file's z coordinate matches the outputs
         simulation.output_writers[:surface] = NetCDFWriter(model, fields; filename = joinpath(ocean_dir, "$(name)_surface.nc"), indices = (:, :, Nz),
-                                                           schedule = TimeInterval(snapshot_interval), overwrite_existing = !append, global_attributes)
+                                                           schedule = writer_schedule(snapshot_interval, save_times), overwrite_existing = !append, global_attributes)
     end
 
     if !isnothing(checkpoint_interval)
@@ -473,7 +644,9 @@ end
 function write_final_snapshot!(simulation)
     haskey(simulation.output_writers, :full_3d) || return nothing
     writer = simulation.output_writers[:full_3d]
-    last_write = writer.schedule.first_actuation_time + writer.schedule.actuations * writer.schedule.interval
+    schedule = writer.schedule
+    last_write = schedule isa SpecifiedTimes ? (schedule.previous_actuation > 0 ? schedule.times[schedule.previous_actuation] : -Inf) :
+                                               schedule.first_actuation_time + schedule.actuations * schedule.interval
     simulation.model.clock.time > last_write + 1 && Oceananigans.write_output!(writer, simulation.model)
     return nothing
 end
@@ -499,12 +672,17 @@ Keywords:
 - `horizontal_mixing`: `:gm_redi` (default; Gent & McWilliams 1990 eddy advection plus Redi 1982 diffusion along isopycnals, slopes
   above 0.01 tapered) or `:horizontal` (diffusion along level surfaces, which mixes across sloping isotherms). A restart keeps its
   run's scheme (`:horizontal` for runs that predate the option), so leave it as `nothing` or pass the same one.
+- `advection`: `:weno5` (default) or `:upwind3`, third-order upwind for momentum and tracers (cheaper and more numerically diffusive; intended for spin-ups).
 - `κ_vertical`: background vertical tracer diffusivity (m²/s).
 - `prandtl`: background Prandtl number, so the background vertical viscosity is `prandtl × κ_vertical` (default 10, as in the
   Pacanowski & Philander 1981 and KPP backgrounds). A restart keeps its run's value (ν/κ for runs that set ν directly), so leave it as
   `nothing` or pass the same one.
 - `vertical_mixing`: `:catke` (default; CATKE, Wagner et al. 2025) or `:convective_adjustment`, added to the background. A restart
   keeps its run's scheme (convective adjustment for runs that predate the option), so leave it as `nothing` or pass the same one.
+- `tidal_eccentricity`: adds tidal mixing (`kappa_tidal`) on top of the background and `vertical_mixing`; `nothing` (default) has none. The column
+  energy is `tidal_fraction` × `tidal_dissipation(rotational_period, tidal_eccentricity, radius, tidal_Q)`, so it scales the mixing with `tidal_Q`.
+- `tidal_z_p`: decay height (m) of the Polzin (2009) dissipation profile above the floor; `Inf` for a uniform ϵ. `tidal_Γ`: `:constant` (0.2) or
+  `:richardson` (Γ(Ri)). `tidal_prandtl` sets the viscosity as a multiple of the tidal κ, and `tidal_κ_max` caps κ (m²/s). Pass the same ones on a restart.
 - `wind_field`: `(lon, lat, t) -> (u_wind, v_wind)` in m/s for a bulk wind stress.
 - `emulator_wind`, `surface_pressure`: force with CLERO-emulated winds of the planet whose emulated (T_day, T_night) match this run's at
   surface pressure `surface_pressure` (bar). The wind file is solved by `src/climate/climate_emulator.py` (Python env `\$EXO_EMULATOR_PYTHON`)
@@ -516,6 +694,10 @@ Keywords:
 - `salinity`: carry a passive salinity tracer initialised to this value (`nothing`: temperature only).
 - `cfl`, `max_Δt`: advective CFL target and timestep cap (inertial stability).
 - `free_surface_cfl`: barotropic wave CFL, which sets the number of free-surface substeps.
+- `wall_time_limit`: stop (with a checkpoint) after this many seconds of wall time; `finished.stopped_by` is then `"wall_time"`.
+- `save_last`: keep the 3D and surface output for only this last stretch of model time (`nothing`: the whole run); `_section` always covers the whole run.
+- `keep_checkpoints`: `false` deletes the run's checkpoints once it finishes normally, keeping them after a NaN or wall-time stop; other runs can warm-start from its 3D snapshots.
+- `compress_output`: deflate and byte-shuffle the run's NetCDF files once it finishes.
 - `restart`: name of a run to continue from its latest checkpoint for a further `simulation_time` (`simulation_name` must be the same).
   The grid comes from its parameter file (grid keywords and `ocean_depth` are ignored); the clock carries on and output is appended
   to its existing files. Other settings come from this call, so pass the same ones to continue the run unchanged.
@@ -523,6 +705,8 @@ Keywords:
   used to pick up a run cut off by a job's wall time.
 - `warm_start`: name of a run whose latest checkpoint starts this new run (clock at 0, new output files). Its parameter file gives
   the donor grid: on the same grid the state is copied exactly, otherwise T, u, v are interpolated onto this run's grid.
+- `initial_snapshot`: name of a run on the same grid whose last 3D snapshot gives T, u, v for a new run with no checkpoint to start from (clock at 0); TKE and
+  the free surface start fresh and adjust in the first steps.
 - `equilibrium_tol`, `equilibrium_window`: stop at deep equilibrium, when, after the first window, both the Gregory-style projected
   remaining change of volume-mean T and its drift over one more window are below `equilibrium_tol` (°C); see `equilibrium_check`. `nothing` runs for the full `simulation_time`.
 - `output_interval`, `snapshot_interval`, `checkpoint_interval`: model time between 3D snapshots, `_section` (zonal-mean lat × z) and
@@ -531,16 +715,19 @@ Keywords:
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
                           resolution = 1.0, max_lat = 80, n_depth = 20,
                           use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
-                          κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing, horizontal_mixing = nothing,
+                          κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing, horizontal_mixing = nothing, advection = :weno5,
+                          tidal_eccentricity = nothing, tidal_Q = 84, tidal_fraction = 0.3, tidal_z_p = 500, tidal_Γ = :constant, tidal_prandtl = 1, tidal_κ_max = 0.1,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0, wind_current_coupling = 1.0,
                           cfl = 0.2, max_Δt = nothing, free_surface_cfl = 0.7,
-                          restart = nothing, resume = false, warm_start = nothing,
+                          restart = nothing, resume = false, warm_start = nothing, initial_snapshot = nothing,
                           equilibrium_tol = nothing, equilibrium_window = 10 * 365days,
-                          output_interval = 5 * 365days, snapshot_interval = 36.5days, checkpoint_interval = nothing)
+                          output_interval = 5 * 365days, snapshot_interval = 36.5days, checkpoint_interval = nothing, wall_time_limit = Inf,
+                          save_last = nothing, keep_checkpoints = true, compress_output = false)
 
     @info "Setting up simulation $(simulation_name)..."
     isnothing(restart) || isnothing(warm_start) || error("pass either restart or warm_start, not both")
+    isnothing(initial_snapshot) || (isnothing(restart) && isnothing(warm_start)) || error("initial_snapshot starts a new run, so it can't go with restart or warm_start")
     isnothing(restart) || restart == simulation_name || error("restart continues the run named $(restart), so simulation_name must be the same")
     !resume || !isnothing(restart) || error("resume continues a run, so it needs restart")
     isnothing(warm_start) || warm_start != simulation_name || error("a warm start writes a new run, so simulation_name must differ from $(warm_start)")
@@ -584,14 +771,16 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
 
     # Sets up model settings
     arch = select_architecture(use_GPU)
-    momentum = WENOVectorInvariant(order = 5)
-    tracers_adv = WENO(order = 5)
-    closure = ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing, horizontal_mixing)
-    halo = required_halo(momentum, tracers_adv, closure)
+    momentum, tracers_adv = advection_schemes(advection)
+    tidal = isnothing(tidal_eccentricity) ? nothing : tidal_parameters(; rotational_period, ocean_depth, planet_radius, eccentricity = tidal_eccentricity, Q = tidal_Q,
+                                                                       fraction = tidal_fraction, z_p = tidal_z_p, Γ = Symbol(tidal_Γ), prandtl = tidal_prandtl, κ_max = tidal_κ_max)
+    halo = required_halo(momentum, tracers_adv, ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing, horizontal_mixing))    # tidal mixing needs no more halo
     grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching, max_lat)
+    tidal_κ = isnothing(tidal) ? nothing : Field{Center, Center, Face}(grid)
+    closure = ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing, horizontal_mixing, tidal = isnothing(tidal) ? nothing : (; κ = tidal_κ, tidal.prandtl))
 
     rotation_rate = rotational_period == 0 ? 0 : omega_Earth / rotational_period
-    eos = LinearEquationOfState(thermal_expansion = 2e-4, haline_contraction = 0.0)
+    eos = LinearEquationOfState(thermal_expansion = THERMAL_EXPANSION, haline_contraction = 0.0)
     buoyancy = isnothing(salinity) ? SeawaterBuoyancy(equation_of_state = eos, constant_salinity = 35.0) : SeawaterBuoyancy(equation_of_state = eos)
 
     wind_stress = isnothing(wind_file) ? nothing :
@@ -616,22 +805,29 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     donor_parameters = isnothing(warm_start) ? nothing : read_parameters(warm_start)
     this_grid = (; n_lon, n_lat, n_depth, ocean_depth = Float64(ocean_depth), max_lat, vertical_stretching, float_type)
     regrid = !isnothing(warm_start) && !same_grid(donor_grid(donor_parameters), this_grid)
-    if regrid
-        @info "Warm-starting from $(latest_checkpoint(warm_start)), regridded from $(donor_grid(donor_parameters))"
-        regrid_warm_start!(model, latest_checkpoint(warm_start), donor_parameters; planet_radius, T_night)
+    if !isnothing(initial_snapshot)
+        @info "Starting from the last 3D snapshot of $(initial_snapshot)"
+        set_from_snapshot!(model, initial_snapshot)
+    elseif regrid
+        @info "Warm-starting from $(warm_start_source(warm_start)), regridded from $(donor_grid(donor_parameters))"
+        regrid_warm_start!(model, warm_start_source(warm_start), donor_parameters; planet_radius, T_night)
+    elseif !isnothing(warm_start) && !has_checkpoint(warm_start)
+        @info "Warm-starting from the last 3D snapshot of $(warm_start) on the same grid"
+        set_from_snapshot!(model, warm_start)
     elseif isnothing(restart) && isnothing(warm_start)
         set!(model, T = T_night)
     end
 
     isnothing(salinity) || set!(model, S = salinity)
 
-    simulation = Simulation(model, Δt = 2minutes, stop_time = simulation_time)
+    simulation = Simulation(model, Δt = 2minutes, stop_time = simulation_time, wall_time_limit = Float64(wall_time_limit))
+    isnothing(tidal) || add_tidal_κ_callback!(simulation, tidal, tidal_κ)
     no_salinity = isnothing(salinity) ? (:S,) : ()
 
-    if !isnothing(warm_start) && !regrid
+    if !isnothing(warm_start) && !regrid && has_checkpoint(warm_start)
         @info "Warm-starting from $(latest_checkpoint(warm_start)) on the same grid"
         new_vertical = run_vertical_mixing(donor_parameters) != vertical_mixing    # the new scheme starts its own TKE and diffusivities
-        new_closure = new_vertical || run_horizontal_mixing(donor_parameters) != horizontal_mixing
+        new_closure = new_vertical || run_horizontal_mixing(donor_parameters) != horizontal_mixing || run_tidal(donor_parameters) != !isnothing(tidal)
         restore_checkpoint!(simulation, latest_checkpoint(warm_start); drop = (no_salinity..., (new_vertical ? (:e,) : ())...),
                             new_closure, reset_clock = true)
     end
@@ -641,20 +837,25 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             planet = (; rotational_period, ocean_depth, planet_radius, T_day, T_night),
             grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
                     z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
-            physics = (; κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
+            physics = (; advection = string(advection), κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
+                       tidal_eccentricity, tidal_Q, tidal_fraction, tidal_z_p, tidal_Γ = string(tidal_Γ), tidal_prandtl, tidal_κ_max,
                        heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
                        wind_file, wind_stress_scale, wind_current_coupling),
-            time = (; simulation_time, cfl, max_Δt, free_surface_cfl, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval),
-            warm_start = (; donor = warm_start, regridded = regrid,
-                          checkpoint = isnothing(warm_start) ? nothing : latest_checkpoint(warm_start))))
+            time = (; simulation_time, cfl, max_Δt, free_surface_cfl, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval,
+                    save_last, keep_checkpoints, compress_output),
+            warm_start = (; donor = warm_start, regridded = regrid, initial_snapshot,
+                          checkpoint = isnothing(warm_start) ? nothing : warm_start_source(warm_start))))
     end
 
     equilibrium = isnothing(equilibrium_tol) ? nothing : equilibrium_check(equilibrium_tol, equilibrium_window, rho_seawater * cp_seawater * ocean_depth)
     simulation.callbacks[:progress] = Callback(progress_callback(model, surface_heat_flux(model, relaxation), equilibrium), IterationInterval(100))
     simulation.callbacks[:wizard] = Callback(TimeStepWizard(; cfl, max_change = 1.05, max_Δt), IterationInterval(10))
     global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale, wind_current_coupling)
+    run_end = isnothing(restart) ? simulation_time : resume ? planned_end(read_parameters(restart)) : nothing
+    !isnothing(save_last) && isnothing(run_end) && @warn "save_last is ignored when extending a finished run; saving all its output"
+    save_times = isnothing(save_last) || isnothing(run_end) ? nothing : (run_end, save_last)
     add_output_writers!(simulation, simulation_name; output_interval, snapshot_interval, checkpoint_interval, global_attributes,
-                        append = !isnothing(restart))
+                        append = !isnothing(restart), save_times)
 
     if !isnothing(restart)    # after the writers exist, so their schedules are restored too
         checkpoint = latest_checkpoint(restart)
@@ -677,9 +878,13 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         @error "$(simulation_name) blew up (NaN) at $(prettytime(t)); its latest checkpoint is $(has_checkpoint(simulation_name) ? latest_checkpoint(simulation_name) : "none")"
         return nothing
     end
-    isnothing(checkpoint_interval) || Oceananigans.OutputWriters.checkpoint(simulation)
+    stopped_by = t >= simulation.stop_time ? "stop_time" : simulation.run_wall_time >= wall_time_limit ? "wall_time" : "equilibrium"
+    remove_checkpoints = !keep_checkpoints && stopped_by != "wall_time"
+    isnothing(checkpoint_interval) || remove_checkpoints || Oceananigans.OutputWriters.checkpoint(simulation)
     write_final_snapshot!(simulation)
-    record_finished!(simulation_name, Float64(t), t >= simulation.stop_time ? "stop_time" : "equilibrium")
+    compress_output && stopped_by != "wall_time" && compress_run_output!(simulation, simulation_name)
+    remove_checkpoints && remove_checkpoints!(simulation_name)
+    record_finished!(simulation_name, Float64(t), stopped_by)
     @info "Simulation finished successfully!"
 
     return nothing

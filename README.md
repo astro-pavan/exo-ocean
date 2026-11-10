@@ -58,8 +58,8 @@ Julia experiments (from any directory):
 
 ```bash
 julia --project=. experiments/sweeps/coriolis_sweep.jl
-julia --project=. experiments/tests/deep_equilibrium.jl 1                     # 1 km ocean to deep equilibrium (GPU)
-julia --project=. -t 16 experiments/tests/deep_equilibrium.jl 1 --res 4 --cpu  # CPU runs: set the thread count with -t
+scripts/launch.sh experiments/tests/p3_resolution_test.jl [test filters]    # background GPU run, logged to logs/ and set up by the script's #launch lines
+scripts/launch.sh -n experiments/tests/p3_resolution_test.jl                # runs the checks and prints the plan without starting anything
 ```
 
 Python analysis (from any directory, with the venv active):

@@ -207,7 +207,7 @@ fi
 step "Setup complete"
 cat <<EOF
     Start each session with:   source env.sh
-    Run an experiment:         julia experiments/tests/test_ocean.jl
+    Run an experiment:         julia experiments/tests/base_case_1km.jl
     Run the analysis:          python analysis/coriolis_jet_analysis.py
     Interactive viewer:        bokeh serve --show analysis/visualisation.py --args \$EXO_OCEAN_OUTPUT/ocean/<run>.nc
     GPU: $([[ $GPU_OK -eq 1 ]] && echo "available (runs with use_GPU=true use it)" || echo "not available (runs fall back to the CPU)")

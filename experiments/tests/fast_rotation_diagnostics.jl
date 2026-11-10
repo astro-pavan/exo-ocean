@@ -222,7 +222,7 @@ function run_test(test_name, P, stage, changes; donor = donor_of(P), common = ba
         return @error "Skipping $(name): $(donor) isn't a finished run with a checkpoint here"
     end
     params = merge(common, (; max_Δt = cap(P)), stage, changes, (; name, rotational_period = P))
-    RECORDER[] = merge((; rotational_period = P, params.T_day, params.T_night, frames = params.resolution < 2), recorder)
+    RECORDER[] = merge((; rotational_period = P, params.T_day, params.T_night, frames = minimum(params.resolution) < 2), recorder)
     try
         simulation(params, nothing, donor)
     catch err

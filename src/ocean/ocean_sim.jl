@@ -705,7 +705,8 @@ Keywords:
 - `emulator_wind`, `surface_pressure`: force with CLERO-emulated winds of the planet whose emulated (T_day, T_night) match this run's at
   surface pressure `surface_pressure` (bar). The wind file is solved by `src/climate/climate_emulator.py` (Python env `\$EXO_EMULATOR_PYTHON`)
   and cached in `\$EXO_OCEAN_OUTPUT/winds/`; errors if no planet matches. Uses the ExoCAM emulator and the nearby M-dwarf mean [Fe/H];
-  `wind_stress_scale` multiplies the stress.
+  `wind_stress_scale` multiplies the stress. `emulator_climate = (T_day, T_night)` (°C) solves the wind for that climate instead of the run's,
+  e.g. to test the ocean's sensitivity to the assumed atmospheric state; the ocean is still relaxed to the run's `T_day`, `T_night`.
 - `function_wind`: force with the closed-form wind in `pattern_wind.jl` instead of the emulator, at surface pressure `surface_pressure` (bar). It needs no planet
   solution, uses an ideal-gas air density and the same bulk stress as `emulator_wind`; `wind_stress_scale` and `wind_current_coupling` apply as for the emulator.
   `air_molar_mass` (kg/mol, default N₂) sets that density; pure N₂ underestimates it for CO₂-rich atmospheres.
@@ -741,7 +742,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                           tidal_eccentricity = nothing, tidal_Q = 84, tidal_fraction = 0.3, tidal_z_p = 500, tidal_Γ = :constant, tidal_prandtl = 1, tidal_κ_max = 0.1,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, function_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0, wind_current_coupling = 1.0, air_molar_mass = N2_MOLAR_MASS,
-                          cfl = 0.2, max_Δt = nothing, free_surface_cfl = 0.7,
+                          emulator_climate = nothing, cfl = 0.2, max_Δt = nothing, free_surface_cfl = 0.7,
                           restart = nothing, resume = false, warm_start = nothing, initial_snapshot = nothing,
                           equilibrium_tol = nothing, equilibrium_window = 10 * 365days,
                           output_interval = 5 * 365days, snapshot_interval = 36.5days, checkpoint_interval = nothing, wall_time_limit = Inf,
@@ -787,8 +788,9 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         isnothing(surface_pressure) && error("emulator_wind = true needs surface_pressure (bar)")
         isnothing(wind_field) || error("pass either wind_field or emulator_wind, not both")
         rotational_period > 0 || error("emulator_wind needs a rotating, tidally locked planet (rotational_period > 0)")
-        wind_file = emulator_wind_file(rotational_period, T_day, T_night, surface_pressure)
+        wind_file = emulator_wind_file(rotational_period, something(emulator_climate, (T_day, T_night))..., surface_pressure)
     end
+    isnothing(emulator_climate) || emulator_wind || error("emulator_climate needs emulator_wind = true")
     if function_wind
         emulator_wind && error("pass either emulator_wind or function_wind, not both")
         isnothing(surface_pressure) && error("function_wind = true needs surface_pressure (bar)")
@@ -879,7 +881,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             physics = (; advection = string(advection), tke_advection, tke_gm_redi, implicit_vertical_diffusion, κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
                        tidal_eccentricity, tidal_Q, tidal_fraction, tidal_z_p, tidal_Γ = string(tidal_Γ), tidal_prandtl, tidal_κ_max,
                        heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, function_wind, surface_pressure,
-                       wind_file, wind_stress_scale, wind_current_coupling, air_molar_mass = function_wind ? air_molar_mass : nothing),
+                       wind_file, wind_stress_scale, wind_current_coupling, air_molar_mass = function_wind ? air_molar_mass : nothing,
+                       emulator_climate = isnothing(emulator_climate) ? nothing : collect(Float64, emulator_climate)),
             time = (; simulation_time, cfl, max_Δt, free_surface_cfl, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval,
                     save_last, keep_checkpoints, compress_output),
             warm_start = (; donor = warm_start, regridded = regrid, initial_snapshot,

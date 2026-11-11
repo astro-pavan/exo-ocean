@@ -9,7 +9,7 @@ using Oceananigans: UpdateStateCallsite
 using Oceananigans.Fields: interpolate, compute!
 using Oceananigans.Grids: λnode, φnode, znode
 using Oceananigans.Operators: ℑxyᶠᶜᵃ, ℑxyᶜᶠᵃ, ∂zᶜᶜᶠ
-using Oceananigans.TurbulenceClosures: IsopycnalSkewSymmetricDiffusivity, shear_squaredᶜᶜᶠ
+using Oceananigans.TurbulenceClosures: IsopycnalSkewSymmetricDiffusivity, ExplicitTimeDiscretization, SmallSlopeIsopycnalTensor, FluxTapering, shear_squaredᶜᶜᶠ
 using NCDatasets
 using Statistics
 using TOML
@@ -32,6 +32,8 @@ const REPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 const directory = get(ENV, "EXO_OCEAN_OUTPUT", joinpath(REPO_ROOT, "output"))
 
 include("emulator_wind.jl")
+include("pattern_wind.jl")
+include("tke_transport.jl")
 
 #####
 ##### Grid
@@ -77,13 +79,13 @@ end
 @inline function bottom_drag_u(i, j, grid, clock, fields)
     u = @inbounds fields.u[i, j, 1]
     v = @inbounds fields.v[i, j, 1]
-    return -C_Bottom_Drag * u * sqrt(u^2 + v^2)
+    return -oftype(u, C_Bottom_Drag) * u * sqrt(u^2 + v^2)
 end
 
 @inline function bottom_drag_v(i, j, grid, clock, fields)
     u = @inbounds fields.u[i, j, 1]
     v = @inbounds fields.v[i, j, 1]
-    return -C_Bottom_Drag * v * sqrt(u^2 + v^2)
+    return -oftype(v, C_Bottom_Drag) * v * sqrt(u^2 + v^2)
 end
 
 # Quadratic bulk wind stress from wind_field(lon, lat, t) -> (u_wind, v_wind) in m/s
@@ -189,18 +191,25 @@ end
 
 # κ_horizontal = 0 omits the horizontal tracer diffusivity; vertical_mixing is added to the constant background of tracer diffusivity
 # κ_vertical and viscosity prandtl × κ_vertical. :gm_redi uses κ_horizontal as both the GM skew and the Redi isopycnal diffusivity,
-# tapered where isopycnal slopes exceed 0.01 (Danabasoglu & McWilliams 1995, J. Climate 8, 2967)
-function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 10, vertical_mixing = :catke, horizontal_mixing = :gm_redi, tidal = nothing)
+# tapered where isopycnal slopes exceed 0.01 (Danabasoglu & McWilliams 1995, J. Climate 8, 2967). tke_gm_redi = false leaves CATKE's TKE out of
+# GM-Redi (tke_transport.jl); `tracers` are the model's other tracers
+function ocean_closure(; κ_horizontal, κ_vertical = 1e-4, prandtl = 1, vertical_mixing = :catke, horizontal_mixing = :gm_redi, tidal = nothing,
+                       tke_gm_redi = true, tracers = (:T,), implicit_vertical_diffusion = false)
     vertical_mixing in VERTICAL_MIXING || error("vertical_mixing must be one of $(VERTICAL_MIXING), got $(repr(vertical_mixing))")
     horizontal_mixing in HORIZONTAL_MIXING || error("horizontal_mixing must be one of $(HORIZONTAL_MIXING), got $(repr(horizontal_mixing))")
+    per_tracer(κ_e) = tke_gm_redi || vertical_mixing != :catke ? κ_horizontal : (; (t => κ_horizontal for t in tracers)..., e = κ_e)
+    FT = Oceananigans.defaults.FloatType    # the tensor and taper otherwise default to Float64 whatever the grid
+    gm_redi() = IsopycnalSkewSymmetricDiffusivity(κ_skew = per_tracer(nothing), κ_symmetric = per_tracer(0),    # Gent & McWilliams (1990), Redi (1982)
+                                                  isopycnal_tensor = SmallSlopeIsopycnalTensor(FT), slope_limiter = FluxTapering(FT(1e-2)))
     horizontal = iszero(κ_horizontal) ? nothing :
-                 horizontal_mixing == :gm_redi ? IsopycnalSkewSymmetricDiffusivity(κ_skew = κ_horizontal, κ_symmetric = κ_horizontal) :    # Gent & McWilliams (1990), Redi (1982)
+                 horizontal_mixing == :gm_redi ? gm_redi() :
                  HorizontalScalarDiffusivity(κ = κ_horizontal)
     mixing = vertical_mixing == :catke ? CATKEVerticalDiffusivity() :    # Wagner et al. (2025, JAMES 17, e2024MS004522)
              ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 1.0, convective_νz = 0.0)
     tidal_mixing = isnothing(tidal) ? nothing : VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); κ = kappa_tidal_stored, ν = viscosity_tidal_stored,
                                                                                          discrete_form = true, loc = (Center, Center, Face), parameters = tidal)
-    closures = (VerticalScalarDiffusivity(ν = prandtl * κ_vertical, κ = κ_vertical), tidal_mixing, horizontal, mixing)
+    background = implicit_vertical_diffusion ? VerticallyImplicitTimeDiscretization() : ExplicitTimeDiscretization()
+    closures = (VerticalScalarDiffusivity(background; ν = prandtl * κ_vertical, κ = κ_vertical), tidal_mixing, horizontal, mixing)
     return Tuple(c for c in closures if !isnothing(c))
 end
 
@@ -228,12 +237,15 @@ function run_prandtl(parameters)
     return haskey(p, "prandtl") ? Float64(p["prandtl"]) : p["ν_vertical"] / p["κ_vertical"]
 end
 
-# Momentum and tracer advection schemes; third-order upwind (Leonard 1979, CMAME 19, 59) adds spurious mixing (Marchesiello et al. 2009, Ocean Modelling 26, 156)
+# Momentum and tracer advection schemes; third-order upwind (Leonard 1979, CMAME 19, 59) adds spurious mixing (Marchesiello et al. 2009, Ocean Modelling 26, 156),
+# so :upwind3_momentum keeps WENO5 for tracers
+const ADVECTION = (:weno5, :upwind3, :upwind3_momentum)
 function advection_schemes(advection)
+    advection in ADVECTION || error("advection must be one of $(ADVECTION), got $(repr(advection))")
     advection == :weno5 && return WENOVectorInvariant(order = 5), WENO(order = 5)
-    advection == :upwind3 || error("advection must be :weno5 or :upwind3, got $(repr(advection))")
     upwind = UpwindBiased(order = 3)
-    return VectorInvariant(vorticity_scheme = upwind, vertical_advection_scheme = upwind, divergence_scheme = upwind), upwind
+    momentum = VectorInvariant(vorticity_scheme = upwind, vertical_advection_scheme = upwind, divergence_scheme = upwind)
+    return momentum, advection == :upwind3 ? upwind : WENO(order = 5)
 end
 
 # Smallest grid halo (at least 3) the schemes and closures need, checked on a small CPU grid of the same type
@@ -667,15 +679,21 @@ Keywords:
 - `max_lat`: the grid spans latitudes ±`max_lat` (< 90), with walls there.
 - `n_depth`, `use_GPU`: number of vertical levels and architecture.
 - `vertical_stretching`: thickness ratio of adjacent vertical cells (√1.2 with 2× `n_depth` halves every default cell).
-- `float_type`: grid precision (Float64 avoids the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there).
+- `float_type`: precision of the grid, schemes and closures (Float64 avoided the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there; those runs
+  built their schemes in Float64 on a Float32 grid). With CATKE, Float32 went NaN within days in most CPU tests, so use Float64.
 - `κ_horizontal`: horizontal tracer diffusivity (m²/s; 0 for none), or with GM-Redi both its eddy-thickness and isopycnal diffusivities.
 - `horizontal_mixing`: `:gm_redi` (default; Gent & McWilliams 1990 eddy advection plus Redi 1982 diffusion along isopycnals, slopes
   above 0.01 tapered) or `:horizontal` (diffusion along level surfaces, which mixes across sloping isotherms). A restart keeps its
   run's scheme (`:horizontal` for runs that predate the option), so leave it as `nothing` or pass the same one.
-- `advection`: `:weno5` (default) or `:upwind3`, third-order upwind for momentum and tracers (cheaper and more numerically diffusive; intended for spin-ups).
+- `advection`: `:weno5` (default), `:upwind3`, third-order upwind for momentum and tracers (cheaper and more numerically diffusive; intended for spin-ups),
+  or `:upwind3_momentum`, third-order upwind momentum with WENO5 tracers.
+- `tke_advection`, `tke_gm_redi`: whether CATKE's turbulent kinetic energy is advected and mixed by GM-Redi like T (both `true` by default). TKE closures
+  such as NEMO's solve only the vertical terms (Gaspar et al. 1990, JGR 95, 16179; Blanke & Delecluse 1993, JPO 23, 1363). Pass the same ones on a restart.
 - `κ_vertical`: background vertical tracer diffusivity (m²/s).
-- `prandtl`: background Prandtl number, so the background vertical viscosity is `prandtl × κ_vertical` (default 10, as in the
-  Pacanowski & Philander 1981 and KPP backgrounds). A restart keeps its run's value (ν/κ for runs that set ν directly), so leave it as
+- `implicit_vertical_diffusion`: step the background vertical diffusion and viscosity implicitly (default `false`, explicit), which removes the
+  0.25 Δz²/κ limit on Δt (see `timestep_cap`); ocean models usually treat vertical diffusion implicitly for this reason (e.g. NEMO, Madec et al. 2019).
+- `prandtl`: background Prandtl number, so the background vertical viscosity is `prandtl × κ_vertical` (default 1).
+  A restart keeps its run's value (ν/κ for runs that set ν directly), so leave it as
   `nothing` or pass the same one.
 - `vertical_mixing`: `:catke` (default; CATKE, Wagner et al. 2025) or `:convective_adjustment`, added to the background. A restart
   keeps its run's scheme (convective adjustment for runs that predate the option), so leave it as `nothing` or pass the same one.
@@ -688,6 +706,9 @@ Keywords:
   surface pressure `surface_pressure` (bar). The wind file is solved by `src/climate/climate_emulator.py` (Python env `\$EXO_EMULATOR_PYTHON`)
   and cached in `\$EXO_OCEAN_OUTPUT/winds/`; errors if no planet matches. Uses the ExoCAM emulator and the nearby M-dwarf mean [Fe/H];
   `wind_stress_scale` multiplies the stress.
+- `function_wind`: force with the closed-form wind in `pattern_wind.jl` instead of the emulator, at surface pressure `surface_pressure` (bar). It needs no planet
+  solution, uses an ideal-gas air density and the same bulk stress as `emulator_wind`; `wind_stress_scale` and `wind_current_coupling` apply as for the emulator.
+  `air_molar_mass` (kg/mol, default N₂) sets that density; pure N₂ underestimates it for CO₂-rich atmospheres.
 - `wind_current_coupling`: s_w, how far the emulator's wind follows the ocean surface current (Renault et al. 2016, JPO 46, 1685, eq. 19;
   2020, JAMES 12, e2019MS001715). The stress uses the wind relative to (1 − s_w) × the top-cell current: 1 (default) ignores the
   current (absolute wind), 0 uses the full relative wind, and 0.3 is Renault et al. (2020)'s global mean for a forced ocean.
@@ -716,9 +737,10 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
                           resolution = 1.0, max_lat = 80, n_depth = 20,
                           use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
                           κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing, horizontal_mixing = nothing, advection = :weno5,
+                          tke_advection = true, tke_gm_redi = true, implicit_vertical_diffusion = false,
                           tidal_eccentricity = nothing, tidal_Q = 84, tidal_fraction = 0.3, tidal_z_p = 500, tidal_Γ = :constant, tidal_prandtl = 1, tidal_κ_max = 0.1,
                           wind_field = nothing, salinity = nothing,
-                          emulator_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0, wind_current_coupling = 1.0,
+                          emulator_wind = false, function_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0, wind_current_coupling = 1.0, air_molar_mass = N2_MOLAR_MASS,
                           cfl = 0.2, max_Δt = nothing, free_surface_cfl = 0.7,
                           restart = nothing, resume = false, warm_start = nothing, initial_snapshot = nothing,
                           equilibrium_tol = nothing, equilibrium_window = 10 * 365days,
@@ -755,7 +777,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     end
     vertical_mixing = Symbol(something(vertical_mixing, :catke))
     horizontal_mixing = Symbol(something(horizontal_mixing, :gm_redi))
-    prandtl = Float64(something(prandtl, 10))
+    prandtl = Float64(something(prandtl, 1))
     ν_vertical = prandtl * κ_vertical
     max_Δt = something(max_Δt, default_max_Δt(rotational_period, max_lat))
 
@@ -767,39 +789,56 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         rotational_period > 0 || error("emulator_wind needs a rotating, tidally locked planet (rotational_period > 0)")
         wind_file = emulator_wind_file(rotational_period, T_day, T_night, surface_pressure)
     end
-    wind_current_coupling == 1 || emulator_wind || error("wind_current_coupling needs emulator_wind = true")
+    if function_wind
+        emulator_wind && error("pass either emulator_wind or function_wind, not both")
+        isnothing(surface_pressure) && error("function_wind = true needs surface_pressure (bar)")
+        isnothing(wind_field) || error("pass either wind_field or function_wind, not both")
+        rotational_period > 0 || error("function_wind needs a rotating, tidally locked planet (rotational_period > 0)")
+        T_day > T_night || error("function_wind needs T_day > T_night")
+    end
+    wind_current_coupling == 1 || emulator_wind || function_wind || error("wind_current_coupling needs emulator_wind or function_wind")
 
-    # Sets up model settings
+    # Sets up model settings; every scheme and closure is built at the grid's precision (constructors default to Oceananigans.defaults.FloatType)
     arch = select_architecture(use_GPU)
+    Oceananigans.defaults.FloatType = float_type
     momentum, tracers_adv = advection_schemes(advection)
+    tracer_names = isnothing(salinity) ? (:T,) : (:T, :S)
+    catke = vertical_mixing == :catke
+    !catke && !(tke_advection && tke_gm_redi) && @warn "tke_advection and tke_gm_redi only apply to CATKE; ignoring them"
+    catke && float_type == Float32 &&
+        @warn "Float32 CATKE runs went NaN within 100–900 steps in most CPU tests (2026-11-11, docs/LLM/simulation_speedups.md §12); Float64 didn't"
+    tracer_advection = catke && !tke_advection ? (; (t => tracers_adv for t in tracer_names)..., e = nothing) : tracers_adv
     tidal = isnothing(tidal_eccentricity) ? nothing : tidal_parameters(; rotational_period, ocean_depth, planet_radius, eccentricity = tidal_eccentricity, Q = tidal_Q,
                                                                        fraction = tidal_fraction, z_p = tidal_z_p, Γ = Symbol(tidal_Γ), prandtl = tidal_prandtl, κ_max = tidal_κ_max)
     halo = required_halo(momentum, tracers_adv, ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing, horizontal_mixing))    # tidal mixing needs no more halo
     grid = ocean_grid(arch; n_lon, n_lat, n_depth, ocean_depth, planet_radius, halo, float_type, r = vertical_stretching, max_lat)
     tidal_κ = isnothing(tidal) ? nothing : Field{Center, Center, Face}(grid)
-    closure = ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing, horizontal_mixing, tidal = isnothing(tidal) ? nothing : (; κ = tidal_κ, tidal.prandtl))
+    closure = ocean_closure(; κ_horizontal, κ_vertical, prandtl, vertical_mixing, horizontal_mixing, tidal = isnothing(tidal) ? nothing : (; κ = tidal_κ, tidal.prandtl),
+                            tke_gm_redi, tracers = tracer_names, implicit_vertical_diffusion)
 
     rotation_rate = rotational_period == 0 ? 0 : omega_Earth / rotational_period
     eos = LinearEquationOfState(thermal_expansion = THERMAL_EXPANSION, haline_contraction = 0.0)
     buoyancy = isnothing(salinity) ? SeawaterBuoyancy(equation_of_state = eos, constant_salinity = 35.0) : SeawaterBuoyancy(equation_of_state = eos)
 
-    wind_stress = isnothing(wind_file) ? nothing :
+    wind_stress = function_wind ? pattern_wind_stress(T_day, T_night, surface_pressure, rotational_period, grid; scale = wind_stress_scale, coupling = wind_current_coupling, molar_mass = air_molar_mass) :
+                  isnothing(wind_file) ? nothing :
                   wind_current_coupling == 1 ? emulator_wind_stress(wind_file, grid; P_rot = rotational_period, scale = wind_stress_scale) :
                   emulator_current_feedback(wind_file, grid, wind_current_coupling; P_rot = rotational_period, scale = wind_stress_scale)
     u_bcs, v_bcs = velocity_boundary_conditions(wind_field, wind_stress)
-    relaxation = (; T_day, T_night, W = Q_surface / (rho_seawater * cp_seawater))
+    relaxation = (; T_day = float_type(T_day), T_night = float_type(T_night), W = float_type(Q_surface / (rho_seawater * cp_seawater)))
     T_bcs = FieldBoundaryConditions(top = FluxBoundaryCondition(surface_relaxation, discrete_form = true, parameters = relaxation))
 
     model = HydrostaticFreeSurfaceModel(grid;
                                         momentum_advection = momentum,
-                                        tracer_advection = tracers_adv,
+                                        tracer_advection,
                                         coriolis = HydrostaticSphericalCoriolis(; rotation_rate),
                                         buoyancy,
-                                        tracers = isnothing(salinity) ? (:T,) : (:T, :S),
+                                        tracers = tracer_names,
                                         closure,
                                         free_surface = SplitExplicitFreeSurface(grid; cfl = free_surface_cfl, fixed_Δt = max_Δt),
                                         boundary_conditions = (; u = u_bcs, v = v_bcs, T = T_bcs)
                                         )
+    Oceananigans.defaults.FloatType = Float64
 
     # Warm starts the model if a snapshot is provided    
     donor_parameters = isnothing(warm_start) ? nothing : read_parameters(warm_start)
@@ -837,10 +876,10 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             planet = (; rotational_period, ocean_depth, planet_radius, T_day, T_night),
             grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
                     z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
-            physics = (; advection = string(advection), κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
+            physics = (; advection = string(advection), tke_advection, tke_gm_redi, implicit_vertical_diffusion, κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
                        tidal_eccentricity, tidal_Q, tidal_fraction, tidal_z_p, tidal_Γ = string(tidal_Γ), tidal_prandtl, tidal_κ_max,
-                       heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, surface_pressure,
-                       wind_file, wind_stress_scale, wind_current_coupling),
+                       heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, function_wind, surface_pressure,
+                       wind_file, wind_stress_scale, wind_current_coupling, air_molar_mass = function_wind ? air_molar_mass : nothing),
             time = (; simulation_time, cfl, max_Δt, free_surface_cfl, equilibrium_tol, equilibrium_window, output_interval, snapshot_interval, checkpoint_interval,
                     save_last, keep_checkpoints, compress_output),
             warm_start = (; donor = warm_start, regridded = regrid, initial_snapshot,
@@ -850,7 +889,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     equilibrium = isnothing(equilibrium_tol) ? nothing : equilibrium_check(equilibrium_tol, equilibrium_window, rho_seawater * cp_seawater * ocean_depth)
     simulation.callbacks[:progress] = Callback(progress_callback(model, surface_heat_flux(model, relaxation), equilibrium), IterationInterval(100))
     simulation.callbacks[:wizard] = Callback(TimeStepWizard(; cfl, max_change = 1.05, max_Δt), IterationInterval(10))
-    global_attributes = isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale, wind_current_coupling)
+    global_attributes = function_wind ? pattern_wind_attributes(surface_pressure, T_day, T_night, wind_stress_scale, wind_current_coupling; molar_mass = air_molar_mass) :
+                        isnothing(wind_file) ? Dict() : emulator_attributes(wind_file, wind_stress_scale, wind_current_coupling)
     run_end = isnothing(restart) ? simulation_time : resume ? planned_end(read_parameters(restart)) : nothing
     !isnothing(save_last) && isnothing(run_end) && @warn "save_last is ignored when extending a finished run; saving all its output"
     save_times = isnothing(save_last) || isnothing(run_end) ? nothing : (run_end, save_last)

@@ -14,7 +14,7 @@ output="${EXO_OCEAN_OUTPUT:-output}"
 fail() { echo "$1"; (( dry )) || exit 1; }
 exists() { compgen -G "$output/$1" > /dev/null; }
 
-limit="" gpu="" conflicts=$name size="" emulator="" niceness="" stamp=0 after=""
+limit="" gpu="" conflicts=$name size="" emulator="" niceness="" stamp=0 after="" threads=4
 chain_labels=() chain_args=()
 while read -r key value; do
     case $key in
@@ -24,6 +24,7 @@ while read -r key value; do
         size) size=$value ;;                        # expected output size, shown beside the free space
         emulator) emulator=$value ;;                # emulator Python is "required" or "optional"
         nice) niceness=$value ;;                    # nice level for the run
+        threads) threads=$value ;;                  # Julia threads (default 4); CPU runs want most of the cores
         timestamp) stamp=1 ;;                       # prefix each log line with the Unix time
         after) after=$value ;;                      # shell command run if the experiment succeeds, with its log in $LOG
         chain) chain_labels+=("${value%% *}"); chain_args+=("${value#* }") ;;  # <label> [args]: one process per chain, log <name>_<label>.log
@@ -54,7 +55,7 @@ echo "Free disk space for the output${size:+ (these runs can reach $size)}:"
 df -h "$output/" 2> /dev/null | tail -1 || true
 
 limit=${LIMIT:-$limit}
-cmd=(julia --project=. -t 4 "$script")
+cmd=(julia --project=. -t "$threads" "$script")
 if [[ -n $limit ]]; then cmd=(timeout "$limit" "${cmd[@]}"); fi
 if [[ -n $niceness ]]; then cmd=(nice -n "$niceness" "${cmd[@]}"); fi
 

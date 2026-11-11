@@ -14,7 +14,7 @@ const MAIN_CHECKPOINT = 365days    # so a run cut off by the wall time loses at 
 const EQUILIBRIUM_TOL = 0.002    # default spin-up equilibrium_tol as a fraction of T_day − T_night
 
 """
-    simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_up_name = "<name>_spinup")
+    simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_up_name = "<name>_spinup", stages = (:spin_up, :main))
 
 Run one `ocean_simulation` from `params`, a NamedTuple with `name`, `rotational_period`, `ocean_depth`, `T_day`, `T_night`, optionally
 `simulation_time` (default 10 years) and `planet_radius` (default `R_Earth`), and any `ocean_simulation` keywords (e.g. `resolution`).
@@ -23,12 +23,13 @@ Run one `ocean_simulation` from `params`, a NamedTuple with `name`, `rotational_
   from it, regridded onto its own grid. By default a 2° spin-up stopped at deep equilibrium (`equilibrium_tol` = 0.2% of
   T_day − T_night unless given) or after 300 years; `nothing` runs the main stage alone.
 - `warm_start`: name of an existing run to start from (the low-res stage if there is one, otherwise the main run).
+- `stages`: which of `:spin_up` and `:main` to run, so two workers can share a sweep (a main stage needs its spin-up finished).
 
 A stage whose parameter file marks it finished is skipped, and an unfinished one with a checkpoint is resumed from it to its planned
 end (it must have the same grid), so rerunning picks up where a sweep stopped; one with no checkpoint reruns from the start. The main
 stage checkpoints every year unless `checkpoint_interval` is given.
 """
-function simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_up_name = "$(params.name)_spinup")
+function simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_up_name = "$(params.name)_spinup", stages = (:spin_up, :main))
     missing_fields = filter(k -> !haskey(params, k), RUN_FIELDS)
     isempty(missing_fields) || error("params is missing $(missing_fields)")
     planet_radius = get(params, :planet_radius, R_Earth)
@@ -48,8 +49,8 @@ function simulation(params, low_res_start = SPIN_UP, warm_start = nothing; spin_
     else
         spin_up = merge((; equilibrium_tol = EQUILIBRIUM_TOL * (params.T_day - params.T_night)), params, low_res_start)
         spin_up = merge(spin_up, (; checkpoint_interval = something(get(spin_up, :checkpoint_interval, nothing), spin_up.simulation_time)))    # the main run needs its checkpoint
-        launch(spin_up_name, spin_up, warm_start)
-        launch(params.name, main, spin_up_name)
+        :spin_up in stages && launch(spin_up_name, spin_up, warm_start)
+        :main in stages && launch(params.name, main, spin_up_name)
     end
     return nothing
 end
@@ -70,12 +71,14 @@ baroclinic_speed(ΔT, resolution) = (resolution >= 2 ? 0.75 : 0.85) * sqrt(abs(�
 const RESOLUTION_LADDER = (2.0, 1.0, 0.5, 0.25)
 
 """
-    required_resolution(params; bounds = (0.5, 1.0))
+    required_resolution(params; bounds = (0.5, 1.0), zonal_coarsening = 2)
 
-Coarsest resolution (degrees) on `RESOLUTION_LADDER`, within `bounds`, at or below a fifth of the equatorial deformation radius √(c/β). The jet's
-width follows that radius (Zeng & Yang 2021; Showman & Polvani 2011, ApJ 738, 71), and measured half-widths are 0.64–1.14 of it. A `resolution` in `params` is kept.
+Coarsest latitude spacing (degrees) on `RESOLUTION_LADDER`, within `bounds`, at or below a fifth of the equatorial deformation radius √(c/β). The jet's
+width follows that radius (Zeng & Yang 2021; Showman & Polvani 2011, ApJ 738, 71), and measured half-widths are 0.64–1.14 of it. Spacings below 1°
+are returned as `(Δlon, Δlat)` with `Δlon = zonal_coarsening × Δlat`: at P = 3 d a 1° × 0.5° grid matched 0.5° within 4% on jet speed and width
+(`experiments/tests/main_stage_grid_test.jl`) at 0.3 of the cost. A `resolution` in `params` is kept.
 """
-function required_resolution(params; bounds = (0.5, 1.0))
+function required_resolution(params; bounds = (0.5, 1.0), zonal_coarsening = 2)
     haskey(params, :resolution) && return params.resolution
     choices = filter(r -> bounds[1] <= r <= bounds[2], RESOLUTION_LADDER)
     isempty(choices) && error("no resolution on $(RESOLUTION_LADDER) lies within $(bounds)")
@@ -84,20 +87,21 @@ function required_resolution(params; bounds = (0.5, 1.0))
     β = 2 * omega_Earth / params.rotational_period / radius
     L_eq = rad2deg(sqrt(baroclinic_speed(params.T_day - params.T_night, last(choices)) / β) / radius)
     i = findfirst(r -> r <= L_eq / 5, choices)
-    return isnothing(i) ? last(choices) : choices[i]
+    Δφ = isnothing(i) ? last(choices) : choices[i]
+    return Δφ < 1 ? (zonal_coarsening * Δφ, Δφ) : Δφ    # the jet is zonal, so fine grids only need the latitude spacing
 end
 
 """
     timestep_cap(params, resolution)
 
 `max_Δt` (s) for a run at `resolution`: min(0.5/ω, 0.30/f_wall, 4 h) from docs/LLM/resolution_timestep_requirements.md, and the explicit background
-diffusion limit 0.25 Δz²/max(κ, ν) in the top cell. c is raised by (κ/1e-4)^(1/6) above the calibrated κ, since thermocline depth goes as κ^(1/3) (Lai & Yang 2022).
+diffusion limit 0.25 Δz²/max(κ, ν) in the top cell unless `implicit_vertical_diffusion` is set. c is raised by (κ/1e-4)^(1/6) above the calibrated κ, since thermocline depth goes as κ^(1/3) (Lai & Yang 2022).
 """
 function timestep_cap(params, resolution)
     P, max_lat, radius = params.rotational_period, get(params, :max_lat, 80), get(params, :planet_radius, R_Earth)
     Δλ, Δφ = resolution isa Tuple ? resolution : (resolution, resolution)
     κ = get(params, :κ_vertical, 1e-4)
-    ν = something(get(params, :prandtl, nothing), 10) * κ
+    ν = something(get(params, :prandtl, nothing), 1) * κ
     c = baroclinic_speed(params.T_day - params.T_night, max(Δλ, Δφ)) * max(1, (κ / 1e-4)^(1 / 6))
     row = max_lat - Δφ / 2
     Δy = deg2rad(Δφ) * radius
@@ -105,7 +109,8 @@ function timestep_cap(params, resolution)
     f_scale = P == 0 ? 0.0 : 2 * omega_Earth / P
     ω = sqrt((f_scale * sind(row))^2 + 4c^2 * (1 / Δx^2 + 1 / Δy^2))
     Δz_top = last(ocean_z_faces(params.ocean_depth, get(params, :n_depth, 20); r = get(params, :vertical_stretching, 1.2)))
-    return min(0.5 / ω, 0.30 / (f_scale * sind(max_lat)), 4hours, 0.25 * Δz_top^2 / max(κ, ν))
+    diffusion = get(params, :implicit_vertical_diffusion, false) ? Inf : 0.25 * Δz_top^2 / max(κ, ν)
+    return min(0.5 / ω, 0.30 / (f_scale * sind(max_lat)), 4hours, diffusion)
 end
 
 """

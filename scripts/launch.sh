@@ -70,12 +70,12 @@ start() {  # log file, then the arguments for the experiment
         (
             trap '' HUP
             if (( stamp )); then
-                "${cmd[@]}" "$@" 2>&1 | gawk '{ print systime(), $0; fflush() }' >> "$log"
+                "${cmd[@]}" "$@" 2>&1 | while IFS= read -r line; do printf '%(%s)T %s\n' -1 "$line"; done    # pure bash: gawk isn't on every box
             else
-                "${cmd[@]}" "$@" >> "$log" 2>&1
+                "${cmd[@]}" "$@" 2>&1
             fi
             if [[ -n $after ]]; then LOG=$log bash -c "$after"; fi
-        ) < /dev/null > /dev/null 2>&1 &
+        ) < /dev/null >> "$log" 2>&1 &
     else
         nohup "${cmd[@]}" "$@" >> "$log" 2>&1 < /dev/null &
     fi

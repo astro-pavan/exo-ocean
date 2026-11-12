@@ -28,8 +28,8 @@ const SPIN_UPS = [
     ("f32spin_fastdiag_p3res_dT10_spinup", "fastdiag_p3res_dT10_spinup", F32),
     ("f32spin_tkeon_spdval_P10_spinup", "spdval_P10_spinup", (; float_type = Float32)),
     ("f32spin_kv1e-5_f32", "spdval_P10_spinup", merge(KV5, F32)),
-    ("f32spin_kv1e-5_f64", "spdval_P10_spinup", merge(KV5, (; tke_advection = false, tke_gm_redi = false))),    # differs from _f32 only in precision
-    ("f32spin_f64rerun_spdval_P10_spinup", "spdval_P10_spinup", (;)),
+    ("f32spin_kv1e-5_float64", "spdval_P10_spinup", merge(KV5, (; tke_advection = false, tke_gm_redi = false))),    # differs from _f32 only in precision
+    ("f32spin_float64_rerun_spdval_P10_spinup", "spdval_P10_spinup", (;)),
 ]
 
 # Main stages from the Float32 spin-ups, as speedup_validation.jl's (test, P, resolution, years, options, donor, wall hours)
@@ -39,7 +39,8 @@ const MAINS = [("f32spin_main_P10", 10, 1.0, 10, merge(off, f32), "f32spin_spdva
 # Run order: the sweep's own case first, each main stage right after its spin-up, the Float64 runs last
 const ORDER = ["f32spin_spdval_P10_spinup", "f32spin_main_P10", "f32spin_spdval_P3_spinup", "f32spin_main_P3", "f32spin_fastdiag_p3res_dT1_spinup",
                "f32spin_res1km_P10_dT1_spinup", "f32spin_fastdiag_p3res_dT10_spinup", "f32spin_tkeon_spdval_P10_spinup", "f32spin_kv1e-5_f32",
-               "f32spin_kv1e-5_f64", "f32spin_f64rerun_spdval_P10_spinup"]
+               "f32spin_kv1e-5_float64", "f32spin_float64_rerun_spdval_P10_spinup"]
+# f32spin_kv1e-5_f64 and f32spin_f64rerun_spdval_P10_spinup (12 Nov) ran in Float32 by mistake (float_type wasn't passed); the _float64 names replace them
 
 freeze() = open(io -> TOML.print(io, Dict(r => read_parameters(r) for r in REFERENCES); sorted = true), REFS_FILE, "w")
 
@@ -58,7 +59,8 @@ function settings(ref)
     used = Set(["heat_exchange_coefficient", "C_Bottom_Drag", "salinity", "emulator_wind", "wind_field", "wind_file", "tidal_eccentricity", "emulator_climate",
                 "ν_vertical", "tidal_Q", "tidal_fraction", "tidal_z_p", "tidal_Γ", "tidal_κ_max", "tidal_prandtl"])
     kw = Dict{Symbol, Any}(:resolution => grid["resolution"] isa Vector ? Tuple(grid["resolution"]) : grid["resolution"], :n_depth => grid["n_depth"],
-                           :max_lat => grid["max_lat"], :vertical_stretching => grid["vertical_stretching"], :use_GPU => true)
+                           :max_lat => grid["max_lat"], :vertical_stretching => grid["vertical_stretching"], :use_GPU => true,
+                           :float_type => Dict("Float32" => Float32, "Float64" => Float64)[grid["float_type"]])    # ocean_simulation's default is Float32
     for k in ("κ_horizontal", "κ_vertical", "prandtl", "tke_advection", "tke_gm_redi", "implicit_vertical_diffusion", "function_wind", "wind_stress_scale",
               "wind_current_coupling")
         haskey(physics, k) && (kw[Symbol(k)] = physics[k]; push!(used, k))
@@ -91,8 +93,10 @@ function run_spin_up(name, ref, overrides)
     planet, kw = settings(ref)
     simulation_time = get(overrides, :simulation_time, planet.simulation_time)
     kw = merge(kw, Base.structdiff(overrides, NamedTuple{(:simulation_time,)}))
-    @info "Validation $(name): $(kw.resolution)°, $(get(kw, :float_type, Float64)), as $(ref) with $(overrides), up to $(round(simulation_time / 365days)) yr"
+    @info "Validation $(name): $(kw.resolution)°, $(kw.float_type), as $(ref) with $(overrides), up to $(round(simulation_time / 365days)) yr"
     ocean_simulation(name, planet.P, planet.D, planet.R, planet.T_day, planet.T_night, simulation_time; kw..., wall_time_limit = 4 * 3600)
+    recorded = read_parameters(name)["grid"]["float_type"]
+    recorded == string(kw.float_type) || error("$(name) ran in $(recorded), not $(kw.float_type)")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

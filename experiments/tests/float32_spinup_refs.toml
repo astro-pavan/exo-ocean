@@ -1,0 +1,340 @@
+
+[fastdiag_p3res_dT10_spinup.finished]
+model_time = 2.2725727086997395e9
+stopped_by = "equilibrium"
+
+[fastdiag_p3res_dT10_spinup.grid]
+architecture = "GPU{CUDABackend}(CUDABackend(false, true))"
+float_type = "Float64"
+halo = [4, 4, 3]
+max_lat = 80
+n_depth = 16
+n_lat = 80
+n_lon = 180
+ocean_depth = 1000.0
+resolution = 2.0
+use_GPU = true
+vertical_stretching = 1.2
+z_faces = [-999.9999999999999, -823.8032208052127, -676.9725714762234, -554.6136970353989, -452.6479683347119, -367.6765277508061, -296.8669939308845, -237.85904908094986, -188.68576170600429, -147.708022226883, -113.55990599428195, -85.1031424671144, -61.389172861141446, -41.62753152283065, -25.1594970742383, -11.436135033744678, -0.0]
+
+[fastdiag_p3res_dT10_spinup.physics]
+C_Bottom_Drag = 0.01
+emulator_wind = false
+heat_exchange_coefficient = 30
+horizontal_mixing = "gm_redi"
+prandtl = 10.0
+salinity = "nothing"
+surface_pressure = "nothing"
+vertical_mixing = "catke"
+wind_current_coupling = 1.0
+wind_field = "nothing"
+wind_file = "nothing"
+wind_stress_scale = 1.0
+"κ_horizontal" = 1000.0
+"κ_vertical" = 0.0001
+"ν_vertical" = 0.001
+
+[fastdiag_p3res_dT10_spinup.planet]
+T_day = 10.0
+T_night = 0.0
+ocean_depth = 1000.0
+planet_radius = 6371000
+rotational_period = 3
+
+[fastdiag_p3res_dT10_spinup.run]
+name = "fastdiag_p3res_dT10_spinup"
+
+[fastdiag_p3res_dT10_spinup.time]
+cfl = 0.2
+checkpoint_interval = 3.1536e8
+equilibrium_tol = 0.01
+equilibrium_window = 6.3072e8
+free_surface_cfl = 0.7
+"max_Δt" = 6268.065505467562
+output_interval = 1.5768e8
+simulation_time = 3.1536e9
+snapshot_interval = 3.1536e6
+
+[fastdiag_p3res_dT10_spinup.warm_start]
+checkpoint = "nothing"
+donor = "nothing"
+regridded = false
+
+[fastdiag_p3res_dT1_spinup.finished]
+model_time = 3.1536e9
+stopped_by = "stop_time"
+
+[fastdiag_p3res_dT1_spinup.grid]
+architecture = "GPU{CUDABackend}(CUDABackend(false, true))"
+float_type = "Float64"
+halo = [4, 4, 3]
+max_lat = 80
+n_depth = 16
+n_lat = 80
+n_lon = 180
+ocean_depth = 1000.0
+resolution = 2.0
+use_GPU = true
+vertical_stretching = 1.2
+z_faces = [-999.9999999999999, -823.8032208052127, -676.9725714762234, -554.6136970353989, -452.6479683347119, -367.6765277508061, -296.8669939308845, -237.85904908094986, -188.68576170600429, -147.708022226883, -113.55990599428195, -85.1031424671144, -61.389172861141446, -41.62753152283065, -25.1594970742383, -11.436135033744678, -0.0]
+
+[fastdiag_p3res_dT1_spinup.physics]
+C_Bottom_Drag = 0.01
+emulator_wind = false
+heat_exchange_coefficient = 30
+horizontal_mixing = "gm_redi"
+prandtl = 10.0
+salinity = "nothing"
+surface_pressure = "nothing"
+vertical_mixing = "catke"
+wind_current_coupling = 1.0
+wind_field = "nothing"
+wind_file = "nothing"
+wind_stress_scale = 1.0
+"κ_horizontal" = 1000.0
+"κ_vertical" = 0.0001
+"ν_vertical" = 0.001
+
+[fastdiag_p3res_dT1_spinup.planet]
+T_day = 1.0
+T_night = 0.0
+ocean_depth = 1000.0
+planet_radius = 6371000
+rotational_period = 3
+
+[fastdiag_p3res_dT1_spinup.run]
+name = "fastdiag_p3res_dT1_spinup"
+
+[fastdiag_p3res_dT1_spinup.time]
+cfl = 0.2
+checkpoint_interval = 3.1536e8
+equilibrium_tol = 0.001
+equilibrium_window = 6.3072e8
+free_surface_cfl = 0.7
+"max_Δt" = 6268.065505467562
+output_interval = 1.5768e8
+simulation_time = 3.1536e9
+snapshot_interval = 3.1536e6
+
+[fastdiag_p3res_dT1_spinup.warm_start]
+checkpoint = "nothing"
+donor = "nothing"
+regridded = false
+
+[res1km_P10_dT1_spinup.finished]
+model_time = 1.2560544e9
+stopped_by = "equilibrium"
+
+[res1km_P10_dT1_spinup.grid]
+architecture = "GPU{CUDABackend}(CUDABackend(false, true))"
+float_type = "Float64"
+halo = [4, 4, 3]
+max_lat = 80
+n_depth = 16
+n_lat = 80
+n_lon = 180
+ocean_depth = 1000.0
+resolution = 2.0
+use_GPU = true
+vertical_stretching = 1.2
+z_faces = [-999.9999999999999, -823.8032208052127, -676.9725714762234, -554.6136970353989, -452.6479683347119, -367.6765277508061, -296.8669939308845, -237.85904908094986, -188.68576170600429, -147.708022226883, -113.55990599428195, -85.1031424671144, -61.389172861141446, -41.62753152283065, -25.1594970742383, -11.436135033744678, -0.0]
+
+[res1km_P10_dT1_spinup.physics]
+C_Bottom_Drag = 0.01
+emulator_wind = false
+heat_exchange_coefficient = 30
+horizontal_mixing = "gm_redi"
+prandtl = 10.0
+salinity = "nothing"
+surface_pressure = "nothing"
+vertical_mixing = "catke"
+wind_current_coupling = 1.0
+wind_field = "nothing"
+wind_file = "nothing"
+wind_stress_scale = 1.0
+"κ_horizontal" = 1000.0
+"κ_vertical" = 0.0001
+"ν_vertical" = 0.001
+
+[res1km_P10_dT1_spinup.planet]
+T_day = 1.0
+T_night = 0.0
+ocean_depth = 1000.0
+planet_radius = 6371000
+rotational_period = 10
+
+[res1km_P10_dT1_spinup.run]
+name = "res1km_P10_dT1_spinup"
+
+[res1km_P10_dT1_spinup.time]
+cfl = 0.2
+checkpoint_interval = 3.1536e8
+equilibrium_tol = 0.03
+equilibrium_window = 6.3072e8
+"max_Δt" = 14400.0
+output_interval = 1.5768e8
+simulation_time = 3.1536e9
+snapshot_interval = 3.1536e6
+
+[res1km_P10_dT1_spinup.warm_start]
+checkpoint = "nothing"
+donor = "nothing"
+regridded = false
+
+[spdval_P10_spinup.finished]
+model_time = 1.4560508963534074e9
+stopped_by = "equilibrium"
+
+[spdval_P10_spinup.grid]
+architecture = "GPU{CUDABackend}(CUDABackend(false, true))"
+float_type = "Float64"
+halo = [4, 4, 3]
+max_lat = 80
+n_depth = 16
+n_lat = 80
+n_lon = 180
+ocean_depth = 1000.0
+resolution = 2.0
+use_GPU = true
+vertical_stretching = 1.2
+z_faces = [-999.9999999999999, -823.8032208052127, -676.9725714762234, -554.6136970353989, -452.6479683347119, -367.6765277508061, -296.8669939308845, -237.85904908094986, -188.68576170600429, -147.708022226883, -113.55990599428195, -85.1031424671144, -61.389172861141446, -41.62753152283065, -25.1594970742383, -11.436135033744678, -0.0]
+
+[spdval_P10_spinup.physics]
+C_Bottom_Drag = 0.01
+advection = "weno5"
+air_molar_mass = 0.0280134
+emulator_climate = "nothing"
+emulator_wind = false
+function_wind = true
+heat_exchange_coefficient = 30
+horizontal_mixing = "gm_redi"
+implicit_vertical_diffusion = false
+prandtl = 1.0
+salinity = "nothing"
+surface_pressure = 4
+tidal_Q = 84
+tidal_eccentricity = "nothing"
+tidal_fraction = 0.3
+tidal_prandtl = 1
+tidal_z_p = 500
+"tidal_Γ" = "constant"
+"tidal_κ_max" = 0.1
+tke_advection = true
+tke_gm_redi = true
+vertical_mixing = "catke"
+wind_current_coupling = 1.0
+wind_field = "nothing"
+wind_file = "nothing"
+wind_stress_scale = 1.0
+"κ_horizontal" = 1000.0
+"κ_vertical" = 0.0001
+"ν_vertical" = 0.0001
+
+[spdval_P10_spinup.planet]
+T_day = 30.0
+T_night = 0.0
+ocean_depth = 1000.0
+planet_radius = 6371000
+rotational_period = 10
+
+[spdval_P10_spinup.run]
+name = "spdval_P10_spinup"
+
+[spdval_P10_spinup.time]
+cfl = 0.2
+checkpoint_interval = 3.1536e8
+compress_output = false
+equilibrium_tol = 0.03
+equilibrium_window = 6.3072e8
+free_surface_cfl = 0.7
+keep_checkpoints = true
+"max_Δt" = 12910.442213003784
+output_interval = 3.1536e8
+save_last = "nothing"
+simulation_time = 4.7304e9
+snapshot_interval = 3.1536e7
+
+[spdval_P10_spinup.warm_start]
+checkpoint = "nothing"
+donor = "nothing"
+initial_snapshot = "nothing"
+regridded = false
+
+[spdval_P3_spinup.finished]
+model_time = 1.438895746669867e9
+stopped_by = "equilibrium"
+
+[spdval_P3_spinup.grid]
+architecture = "GPU{CUDABackend}(CUDABackend(false, true))"
+float_type = "Float64"
+halo = [4, 4, 3]
+max_lat = 80
+n_depth = 16
+n_lat = 80
+n_lon = 180
+ocean_depth = 1000.0
+resolution = 2.0
+use_GPU = true
+vertical_stretching = 1.2
+z_faces = [-999.9999999999999, -823.8032208052127, -676.9725714762234, -554.6136970353989, -452.6479683347119, -367.6765277508061, -296.8669939308845, -237.85904908094986, -188.68576170600429, -147.708022226883, -113.55990599428195, -85.1031424671144, -61.389172861141446, -41.62753152283065, -25.1594970742383, -11.436135033744678, -0.0]
+
+[spdval_P3_spinup.physics]
+C_Bottom_Drag = 0.01
+advection = "weno5"
+air_molar_mass = 0.0280134
+emulator_climate = "nothing"
+emulator_wind = false
+function_wind = true
+heat_exchange_coefficient = 30
+horizontal_mixing = "gm_redi"
+implicit_vertical_diffusion = false
+prandtl = 1.0
+salinity = "nothing"
+surface_pressure = 4
+tidal_Q = 84
+tidal_eccentricity = "nothing"
+tidal_fraction = 0.3
+tidal_prandtl = 1
+tidal_z_p = 500
+"tidal_Γ" = "constant"
+"tidal_κ_max" = 0.1
+tke_advection = true
+tke_gm_redi = true
+vertical_mixing = "catke"
+wind_current_coupling = 1.0
+wind_field = "nothing"
+wind_file = "nothing"
+wind_stress_scale = 1.0
+"κ_horizontal" = 1000.0
+"κ_vertical" = 0.0001
+"ν_vertical" = 0.0001
+
+[spdval_P3_spinup.planet]
+T_day = 30.0
+T_night = 0.0
+ocean_depth = 1000.0
+planet_radius = 6371000
+rotational_period = 3
+
+[spdval_P3_spinup.run]
+name = "spdval_P3_spinup"
+
+[spdval_P3_spinup.time]
+cfl = 0.2
+checkpoint_interval = 3.1536e8
+compress_output = false
+equilibrium_tol = 0.03
+equilibrium_window = 6.3072e8
+free_surface_cfl = 0.7
+keep_checkpoints = true
+"max_Δt" = 6268.065505467562
+output_interval = 3.1536e8
+save_last = "nothing"
+simulation_time = 4.7304e9
+snapshot_interval = 3.1536e7
+
+[spdval_P3_spinup.warm_start]
+checkpoint = "nothing"
+donor = "nothing"
+initial_snapshot = "nothing"
+regridded = false

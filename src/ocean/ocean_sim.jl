@@ -5,6 +5,7 @@ using Oceananigans.AbstractOperations: @at, Average
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.BoundaryConditions: fill_halo_regions!
 using Oceananigans.Diagnostics: AdvectiveCFL, hasnan
+using Oceananigans.Advection: FunctionStencil, OnlySelfUpwinding, divergence_smoothness
 using Oceananigans: UpdateStateCallsite
 using Oceananigans.Fields: interpolate, compute!
 using Oceananigans.Grids: λnode, φnode, znode
@@ -237,15 +238,22 @@ function run_prandtl(parameters)
     return haskey(p, "prandtl") ? Float64(p["prandtl"]) : p["ν_vertical"] / p["κ_vertical"]
 end
 
-# Momentum and tracer advection schemes; third-order upwind (Leonard 1979, CMAME 19, 59) adds spurious mixing (Marchesiello et al. 2009, Ocean Modelling 26, 156),
-# so :upwind3_momentum keeps WENO5 for tracers
-const ADVECTION = (:weno5, :upwind3, :upwind3_momentum)
-function advection_schemes(advection)
-    advection in ADVECTION || error("advection must be one of $(ADVECTION), got $(repr(advection))")
-    advection == :weno5 && return WENOVectorInvariant(order = 5), WENO(order = 5)
-    upwind = UpwindBiased(order = 3)
-    momentum = VectorInvariant(vorticity_scheme = upwind, vertical_advection_scheme = upwind, divergence_scheme = upwind)
-    return momentum, advection == :upwind3 ? upwind : WENO(order = 5)
+# WENO-Z weights C(1 + (τ/(β + 1f-8))²) of the momentum divergence flux overflow Float32: its smoothness is an area-weighted transport (m³/s), so
+# β ~ 1e9–1e15. A constant factor leaves τ/β, hence the weights, unchanged (simulation_speedups.md §12.6; Borges et al. 2008, JCP 227, 3191)
+const DIVERGENCE_SCALE = 1e-4
+
+struct ScaledDivergence{FT} <: Function    # the WENO stencil code dispatches function stencils on ::Function
+    scale :: FT
+end
+
+@inline (s::ScaledDivergence)(i, j, k, grid, u, v) = s.scale * divergence_smoothness(i, j, k, grid, u, v)
+
+# WENO5 momentum (vector invariant) and tracer advection at `FT`; Float32 rescales the divergence smoothness, Float64 is built as Oceananigans' default
+function advection_schemes(FT)
+    FT == Float64 && return WENOVectorInvariant(FT; order = 5), WENO(FT; order = 5)
+    stencil = FunctionStencil(ScaledDivergence(FT(DIVERGENCE_SCALE)))
+    upwinding = OnlySelfUpwinding(cross_scheme = WENO(FT; order = 5), δU_stencil = stencil, δV_stencil = stencil)
+    return WENOVectorInvariant(FT; order = 5, upwinding), WENO(FT; order = 5)
 end
 
 # Smallest grid halo (at least 3) the schemes and closures need, checked on a small CPU grid of the same type
@@ -679,16 +687,16 @@ Keywords:
 - `max_lat`: the grid spans latitudes ±`max_lat` (< 90), with walls there.
 - `n_depth`, `use_GPU`: number of vertical levels and architecture.
 - `vertical_stretching`: thickness ratio of adjacent vertical cells (√1.2 with 2× `n_depth` halves every default cell).
-- `float_type`: precision of the grid, schemes and closures (Float64 avoided the Float32 WENO NaNs seen on the H100, at ~1.3× the cost there; those runs
-  built their schemes in Float64 on a Float32 grid). With CATKE, Float32 went NaN within days in most CPU tests, so use Float64.
+- `float_type`: precision of the grid, schemes and closures (default Float32, ~10× faster than Float64 on the RTX cards). Float32 rescales the WENO
+  momentum divergence smoothness, whose weights otherwise overflow (`advection_schemes`); it matched Float64 within run-to-run differences in spin-ups and
+  main stages with the TKE transport off (simulation_speedups.md §12.6–12.8).
 - `κ_horizontal`: horizontal tracer diffusivity (m²/s; 0 for none), or with GM-Redi both its eddy-thickness and isopycnal diffusivities.
 - `horizontal_mixing`: `:gm_redi` (default; Gent & McWilliams 1990 eddy advection plus Redi 1982 diffusion along isopycnals, slopes
   above 0.01 tapered) or `:horizontal` (diffusion along level surfaces, which mixes across sloping isotherms). A restart keeps its
   run's scheme (`:horizontal` for runs that predate the option), so leave it as `nothing` or pass the same one.
-- `advection`: `:weno5` (default), `:upwind3`, third-order upwind for momentum and tracers (cheaper and more numerically diffusive; intended for spin-ups),
-  or `:upwind3_momentum`, third-order upwind momentum with WENO5 tracers.
-- `tke_advection`, `tke_gm_redi`: whether CATKE's turbulent kinetic energy is advected and mixed by GM-Redi like T (both `true` by default). TKE closures
-  such as NEMO's solve only the vertical terms (Gaspar et al. 1990, JGR 95, 16179; Blanke & Delecluse 1993, JPO 23, 1363). Pass the same ones on a restart.
+- `tke_advection`, `tke_gm_redi`: whether CATKE's turbulent kinetic energy is advected and mixed by GM-Redi like T (both `false` by default; one Float32
+  run with them on went NaN). TKE closures such as NEMO's solve only the vertical terms (Gaspar et al. 1990, JGR 95, 16179; Blanke & Delecluse 1993,
+  JPO 23, 1363). A restart keeps its run's settings (`true` for runs that predate the options).
 - `κ_vertical`: background vertical tracer diffusivity (m²/s).
 - `implicit_vertical_diffusion`: step the background vertical diffusion and viscosity implicitly (default `false`, explicit), which removes the
   0.25 Δz²/κ limit on Δt (see `timestep_cap`); ocean models usually treat vertical diffusion implicitly for this reason (e.g. NEMO, Madec et al. 2019).
@@ -737,8 +745,8 @@ Keywords:
 function ocean_simulation(simulation_name, rotational_period, ocean_depth, planet_radius, T_day, T_night, simulation_time;
                           resolution = 1.0, max_lat = 80, n_depth = 20,
                           use_GPU = true, float_type = Float32, vertical_stretching = 1.2,
-                          κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing, horizontal_mixing = nothing, advection = :weno5,
-                          tke_advection = true, tke_gm_redi = true, implicit_vertical_diffusion = false,
+                          κ_horizontal = 1e3, κ_vertical = 1e-4, prandtl = nothing, vertical_mixing = nothing, horizontal_mixing = nothing,
+                          tke_advection = false, tke_gm_redi = false, implicit_vertical_diffusion = false,
                           tidal_eccentricity = nothing, tidal_Q = 84, tidal_fraction = 0.3, tidal_z_p = 500, tidal_Γ = :constant, tidal_prandtl = 1, tidal_κ_max = 0.1,
                           wind_field = nothing, salinity = nothing,
                           emulator_wind = false, function_wind = false, surface_pressure = nothing, wind_stress_scale = 1.0, wind_current_coupling = 1.0, air_molar_mass = N2_MOLAR_MASS,
@@ -775,6 +783,8 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
         isnothing(prandtl) || isapprox(prandtl, run_pr; rtol = 1e-6) ||
             error("$(restart) ran with prandtl = $(run_pr), so it can't continue with $(prandtl)")
         prandtl = run_pr
+        tke_advection = get(restart_parameters["physics"], "tke_advection", true)    # runs before the options transported TKE like T
+        tke_gm_redi = get(restart_parameters["physics"], "tke_gm_redi", true)
     end
     vertical_mixing = Symbol(something(vertical_mixing, :catke))
     horizontal_mixing = Symbol(something(horizontal_mixing, :gm_redi))
@@ -803,12 +813,12 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
     # Sets up model settings; every scheme and closure is built at the grid's precision (constructors default to Oceananigans.defaults.FloatType)
     arch = select_architecture(use_GPU)
     Oceananigans.defaults.FloatType = float_type
-    momentum, tracers_adv = advection_schemes(advection)
+    momentum, tracers_adv = advection_schemes(float_type)
     tracer_names = isnothing(salinity) ? (:T,) : (:T, :S)
     catke = vertical_mixing == :catke
     !catke && !(tke_advection && tke_gm_redi) && @warn "tke_advection and tke_gm_redi only apply to CATKE; ignoring them"
-    catke && float_type == Float32 &&
-        @warn "Float32 CATKE runs went NaN within 100–900 steps in most CPU tests (2026-11-11, docs/LLM/simulation_speedups.md §12); Float64 didn't"
+    catke && float_type == Float32 && (tke_advection || tke_gm_redi) &&
+        @warn "A Float32 run with CATKE's TKE advected and GM-mixed went NaN after ~4 yr (simulation_speedups.md §12.7); Float32 is validated with both off"
     tracer_advection = catke && !tke_advection ? (; (t => tracers_adv for t in tracer_names)..., e = nothing) : tracers_adv
     tidal = isnothing(tidal_eccentricity) ? nothing : tidal_parameters(; rotational_period, ocean_depth, planet_radius, eccentricity = tidal_eccentricity, Q = tidal_Q,
                                                                        fraction = tidal_fraction, z_p = tidal_z_p, Γ = Symbol(tidal_Γ), prandtl = tidal_prandtl, κ_max = tidal_κ_max)
@@ -878,7 +888,7 @@ function ocean_simulation(simulation_name, rotational_period, ocean_depth, plane
             planet = (; rotational_period, ocean_depth, planet_radius, T_day, T_night),
             grid = (; resolution, n_lon, n_lat, n_depth, ocean_depth, max_lat, vertical_stretching, float_type, halo,
                     z_faces = first(ocean_z_faces(ocean_depth, n_depth; r = vertical_stretching)), use_GPU, architecture = string(arch)),
-            physics = (; advection = string(advection), tke_advection, tke_gm_redi, implicit_vertical_diffusion, κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
+            physics = (; advection = "weno5", weno_divergence_scale = float_type == Float32 ? DIVERGENCE_SCALE : nothing, tke_advection, tke_gm_redi, implicit_vertical_diffusion, κ_horizontal, horizontal_mixing = string(horizontal_mixing), κ_vertical, prandtl, ν_vertical, vertical_mixing = string(vertical_mixing),
                        tidal_eccentricity, tidal_Q, tidal_fraction, tidal_z_p, tidal_Γ = string(tidal_Γ), tidal_prandtl, tidal_κ_max,
                        heat_exchange_coefficient = Q_surface, C_Bottom_Drag, salinity, wind_field = isnothing(wind_field) ? nothing : "custom function", emulator_wind, function_wind, surface_pressure,
                        wind_file, wind_stress_scale, wind_current_coupling, air_molar_mass = function_wind ? air_molar_mass : nothing,

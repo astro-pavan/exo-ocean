@@ -5,6 +5,7 @@ output
 .claude
 docs/LLM/
 docs/derivations/*.jpg
+scripts/sync_logs.sh
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

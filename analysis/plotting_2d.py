@@ -24,6 +24,7 @@ except ImportError:
 TERMINATOR_STYLE = dict(color='0.3', linestyle='--', linewidth=0.8)  # day-night boundary at lon = ±90° (substellar at lon = lat = 0)
 SUBSTELLAR_STYLE = dict(marker='*', markersize=14, color='gold', mec='k', zorder=5, clip_on=False)
 ARROW_STYLE = dict(width=0.0025, headwidth=4, color='k')
+SECTION_LINE_STYLE = dict(color='black', linewidth=1.5)
 DAY_NIGHT_LABELS = ((-135, 'Nightside'), (-45, 'Dayside'), (0, 'Substellar'), (45, 'Dayside'), (135, 'Nightside'))
 
 
@@ -283,8 +284,12 @@ def _vertical_velocity(sim, passes):
     return shapiro_filter(sim.w, order=2, passes=passes) if passes > 0 else sim.w
 
 
-def _axes(xlabel, ylabel, title, figsize=(10, 5), projection=None):
-    fig, ax = plt.subplots(figsize=figsize, layout='constrained', subplot_kw={'projection': projection})
+def _axes(xlabel, ylabel, title, figsize=(10, 5), projection=None, slot=None):
+    """Labelled axes in a new figure, or in the gridspec cell `slot` of an existing one."""
+    if slot is None:
+        _, ax = plt.subplots(figsize=figsize, layout='constrained', subplot_kw={'projection': projection})
+    else:
+        ax = slot.get_gridspec().figure.add_subplot(slot, projection=projection)
     ax.set(xlabel=xlabel, ylabel=ylabel)
     if title is not None:
         ax.set_title(title, pad=6 if projection is None else 24)  # curved axes: clear the day/night labels
@@ -292,13 +297,13 @@ def _axes(xlabel, ylabel, title, figsize=(10, 5), projection=None):
 
 
 def _section_axes(sim, xlabel, title, polar, theta_formatter=None, theta_zero='N', theta_direction=1, thetalim=None,
-                  figsize=(8, 7)):
+                  figsize=(8, 7), slot=None):
     """Axes for a vertical section: flat with depth downwards, or polar with height as radius and a hole as deep as the ocean."""
     if not polar:
-        ax = _axes(f'{xlabel} (°)', 'Depth (m)', None)
+        ax = _axes(f'{xlabel} (°)', 'Depth (m)', None, slot=slot)
         ax.invert_yaxis()
         return ax
-    ax = _axes(xlabel, '', title, figsize=figsize, projection='polar')
+    ax = _axes(xlabel, '', title, figsize=figsize, projection='polar', slot=slot)
     ax.set_theta_zero_location(theta_zero)
     ax.set_theta_direction(theta_direction)
     if thetalim is not None:
@@ -344,7 +349,7 @@ def equatorial_section(sim: SimulationData, style='stream', polar=False, colour=
 
 
 def meridional_section(sim: SimulationData, lon=0, style='stream', polar=True, landscape=False, colour='u',
-                       w_filter_passes=0, substellar=True, **kwargs):
+                       w_filter_passes=0, substellar=True, slot=None, **kwargs):
     """
     Latitude-depth section of (v, w) along the longitude column nearest `lon` (default: substellar).
 
@@ -352,6 +357,8 @@ def meridional_section(sim: SimulationData, lon=0, style='stream', polar=True, l
             height as radius) with a hole as deep as the ocean; False gives a flat latitude-depth plot.
     landscape : lay the semicircle flat-side down (equator up, north on the right) instead of upright.
     colour, w_filter_passes, substellar as in equatorial_section; arrow lengths use the in-plane speed |(v, w)|.
+    slot : gridspec cell of an existing figure to draw in; None makes a new figure.
+    kwargs : passed to plot_flow, and override the colour styling (e.g. norm to fix the colour range).
     """
     j = np.argmin(np.abs((sim.lon - lon + 180) % 360 - 180))
     u, v, w = sim.u[:, :, j], sim.v[:, :, j], _vertical_velocity(sim, w_filter_passes)[:, :, j]
@@ -361,7 +368,7 @@ def meridional_section(sim: SimulationData, lon=0, style='stream', polar=True, l
     orientation = dict(theta_zero='N', theta_direction=-1, figsize=(7, 6.2)) if landscape else \
         dict(theta_zero='E', figsize=(6, 7))
     ax = _section_axes(sim, 'Latitude', f'Meridional circulation (lon = {sim.lon[j]:.1f}°, {side})', polar,
-                       theta_formatter=_latitude_label, thetalim=(-90, 90), **orientation)
+                       theta_formatter=_latitude_label, thetalim=(-90, 90), slot=slot, **orientation)
     if polar and landscape:
         # the half disc fills only the middle of the square polar box: keep title and colorbar inside that box
         ax.set_title(ax.get_title(), y=0.84, pad=0)
@@ -370,14 +377,14 @@ def meridional_section(sim: SimulationData, lon=0, style='stream', polar=True, l
         kwargs.setdefault('cax', ax.inset_axes([0.2, 0.13, 0.55, 0.03]))
     kwargs.setdefault('n_arrows', (24, 5) if polar else (32, 12))
     x, y, dx_dt, dy_dt = _section_coords(ax, sim, sim.lat, np.degrees(v / sim.radius), w)
-    plot_flow(ax, x, y, dx_dt, dy_dt, np.hypot(v, w), style=style, **_colour_field(colour, u, v, w, T), **kwargs)
+    plot_flow(ax, x, y, dx_dt, dy_dt, np.hypot(v, w), style=style, **(_colour_field(colour, u, v, w, T) | kwargs))
     if substellar and abs(sim.lon[j]) < np.diff(sim.lon[:2])[0]:  # section passes through the substellar point
         ax.plot(0, 0 if polar else -sim.z[-1], **SUBSTELLAR_STYLE)
     return ax
 
 
 def horizontal_circulation(sim: SimulationData, level=-1, style='stream', colour='speed', w_filter_passes=0,
-                           projection=None, centre=(0, 0), arrow_step=10, substellar=True, **kwargs):
+                           projection=None, centre=(0, 0), arrow_step=10, substellar=True, slot=None, **kwargs):
     """
     Latitude-longitude map of (u, v) at one depth level; colour and w_filter_passes as in equatorial_section.
 
@@ -386,6 +393,7 @@ def horizontal_circulation(sim: SimulationData, level=-1, style='stream', colour
     centre     : (lat, lon) at the centre of the orthographic globe; default is the substellar point.
     arrow_step : globe quiver arrows sit on the lon/lat graticule every arrow_step degrees (gridlines every 3 steps).
     substellar : mark the substellar point (lon = lat = 0).
+    slot       : gridspec cell of an existing figure to draw in; None makes a new figure.
     """
     u, v, w = sim.u[level], sim.v[level], _vertical_velocity(sim, w_filter_passes)[level]
     T = sim.T[level]
@@ -397,7 +405,7 @@ def horizontal_circulation(sim: SimulationData, level=-1, style='stream', colour
         if ccrs is None:
             raise ImportError("projection='orthographic' needs cartopy (installed in ocean-venv)")
         proj = ccrs.Orthographic(central_longitude=centre[1], central_latitude=centre[0])
-        ax = _axes('', '', None, figsize=(7, 6), projection=proj)
+        ax = _axes('', '', None, figsize=(7, 6), projection=proj, slot=slot)
         ax.set_global()
         grid_step = 3 * arrow_step
         ax.gridlines(color='0.6', linewidth=0.4, xlocs=np.arange(-180, 180, grid_step),
@@ -407,7 +415,7 @@ def horizontal_circulation(sim: SimulationData, level=-1, style='stream', colour
             proj, sim.lon, sim.lat, (colour_kw['background'], speed), (dlon_dt, dlat_dt))
     else:
         to_axis = np.radians if projection else np.asarray  # world-map projections take (lon, lat) in radians
-        ax = _axes('Longitude (°)', 'Latitude (°)', None, projection=projection)
+        ax = _axes('Longitude (°)', 'Latitude (°)', None, projection=projection, slot=slot)
         if projection:
             ax.grid(color='0.6', linewidth=0.4)
         x, y, dx_dt, dy_dt = (to_axis(a) for a in (sim.lon, sim.lat, dlon_dt, dlat_dt))
@@ -436,11 +444,34 @@ def _save_animation(frames, path, fps):
     writer.close()
 
 
-def rotating_globe(sim: SimulationData, path, lat=20, n_frames=72, fps=12, dpi=100, style='quiver', **kwargs):
+def _globe_frame(sim, centre, section_kw, **kwargs):
+    """Orthographic globe centred on (lat, lon), beside the section along its central meridian if section_kw is given."""
+    if section_kw is None:
+        return horizontal_circulation(sim, projection='orthographic', centre=centre, **kwargs)
+    fig = plt.figure(figsize=(12, 6), layout='constrained')
+    globe_slot, section_slot = fig.add_gridspec(1, 2, width_ratios=(7, 5))
+    ax = horizontal_circulation(sim, projection='orthographic', centre=centre, slot=globe_slot, **kwargs)
+    ax.plot(np.full(181, centre[1]), np.linspace(-90, 90, 181), transform=ccrs.Geodetic(), **SECTION_LINE_STYLE)
+    meridional_section(sim, lon=centre[1], slot=section_slot, **section_kw)
+    return ax
+
+
+def _fixed_section_scales(sim, colour, w_filter_passes):
+    """Colour norm and arrow reference speed from the whole ocean, so they don't change as a section moves."""
+    w = _vertical_velocity(sim, w_filter_passes)
+    return dict(norm=_colour_field(colour, sim.u, sim.v, w, sim.T)['norm'],
+                ref_speed=_round_1sf(np.nanpercentile(np.hypot(sim.v, w), 95)))
+
+
+def rotating_globe(sim: SimulationData, path, lat=20, n_frames=72, fps=12, dpi=100, style='quiver', section=False,
+                   section_kw=None, **kwargs):
     """
     Animate horizontal_circulation on the orthographic globe turning once eastward, seen from latitude `lat`.
 
     path   : output file, '.gif' (Pillow) or '.mp4' (needs imageio-ffmpeg).
+    section : also show the full-depth meridional section along the globe's central meridian (marked on the globe).
+    section_kw : passed to meridional_section (colour, style, n_arrows, ...); style and any colour, w_filter_passes
+                 or substellar given for the globe are used unless overridden here.
     kwargs : passed to horizontal_circulation (level, colour, w_filter_passes, arrow_step, substellar, ref_speed, ...).
     The colour scale and the arrow reference speed come from the whole level, so they are fixed between frames.
     """
@@ -449,10 +480,16 @@ def rotating_globe(sim: SimulationData, path, lat=20, n_frames=72, fps=12, dpi=1
         raise ValueError(f"path must end in .gif or .mp4, not {path.suffix!r}")
     level = kwargs.get('level', -1)
     kwargs.setdefault('ref_speed', _round_1sf(np.nanpercentile(np.hypot(sim.u[level], sim.v[level]), 95)))
+    if section:
+        shared = {k: kwargs[k] for k in ('colour', 'w_filter_passes', 'substellar') if k in kwargs}
+        section_kw = {'style': style, **shared, **(section_kw or {})}
+        section_kw = _fixed_section_scales(sim, section_kw.get('colour', 'u'), section_kw.get('w_filter_passes', 0)) | section_kw
+    else:
+        section_kw = None
 
     frames = []
     for lon in -np.linspace(0, 360, n_frames, endpoint=False):  # view moves west, so the surface turns east
-        ax = horizontal_circulation(sim, projection='orthographic', centre=(lat, lon), style=style, **kwargs)
+        ax = _globe_frame(sim, (lat, lon), section_kw, style=style, **kwargs)
         buffer = io.BytesIO()
         ax.figure.savefig(buffer, format='png', dpi=dpi)
         plt.close(ax.figure)
@@ -465,10 +502,11 @@ if __name__ == '__main__':
 
     data = SimulationData('output/ocean/deepeq_P_10_dT_30.0_D_1.nc')
 
-    horizontal_circulation(data, style='quiver', projection='mollweide', colour='T')
-    equatorial_section(data, style='quiver', polar=True, colour='T')
-    meridional_section(data, style='quiver', colour='u', landscape=True)
-    horizontal_circulation(data, style='quiver', projection='orthographic', colour='u', centre=(30, 60))
-    # rotating_globe(data, 'figures/globe.mp4', colour='T', substellar=False, n_frames=240, fps=24) 
+    # horizontal_circulation(data, style='quiver', projection='mollweide', colour='T')
+    # equatorial_section(data, style='quiver', polar=True, colour='T')
+    # meridional_section(data, style='quiver', colour='u', landscape=True)
+    # horizontal_circulation(data, style='quiver', projection='orthographic', colour='u', centre=(30, 60))
+    
+    rotating_globe(data, 'figures/globe2.mp4', section=True, colour='T', substellar=False, n_frames=240, fps=24) 
     
     plt.show()

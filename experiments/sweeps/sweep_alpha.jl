@@ -3,11 +3,12 @@
 # for warm starts with κ ≥ 1e-4), then runs 10 years at the resolution the jet needs. The launcher starts two processes: one walks the tree running
 # spin-ups, the other runs main stages as their spin-ups finish, so the GPU never waits for a spin-up. Every stage runs with ocean_simulation's defaults of
 # Float32, WENO and no TKE transport, validated against Float64 in docs/LLM/simulation_speedups.md §12.6–12.8.
-#   scripts/launch.sh experiments/sweeps/single_depth_sweep_constant_kappa.jl                     starts both workers (or resumes the sweep)
-#   julia --project=. -t 4 experiments/sweeps/single_depth_sweep_constant_kappa.jl                runs spin-up and main stage of each point in turn
-#   julia --project=. experiments/sweeps/single_depth_sweep_constant_kappa.jl --plan              prints the tree and each case's resolution and Δt caps
+#   scripts/launch.sh experiments/sweeps/sweep_alpha.jl                     starts both workers (or resumes the sweep)
+#   julia --project=. -t 4 experiments/sweeps/sweep_alpha.jl                runs spin-up and main stage of each point in turn
+#   julia --project=. experiments/sweeps/sweep_alpha.jl --plan              prints the tree and each case's resolution and Δt caps
 #launch gpu RTX 2000
 #launch threads auto
+#launch timestamp
 #launch size ~40 GB
 #launch conflicts step_cost_benchmark|speedup_validation
 #launch chain spinups --spin-ups
@@ -37,8 +38,7 @@ end
 
 plan_only = "--plan" in ARGS
 stages = "--spin-ups" in ARGS ? :spin_ups : "--mains" in ARGS ? :mains : :all
-const PREDICTOR_AXES = (:T_day, :κ_vertical)    # offline tests on finished runs cut the start error along these, but not along rotation period
-tree_sweep(base; prefix = "constkappa1km", point_settings, spin_up, plan_only, stages, predictor_axes = PREDICTOR_AXES,
+tree_sweep(base; prefix = "constkappa1km", point_settings, spin_up, plan_only, stages,
            T_day = ΔT, rotational_period = P_ROT, surface_pressure = P_SURF, κ_vertical = KAPPA)
 
 if plan_only

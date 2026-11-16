@@ -37,73 +37,10 @@ function tree_plan(prefix, swept; root = nothing)
     coordinates = CartesianIndices(lengths)
     point(v) = NamedTuple{Tuple(keys(swept))}(ntuple(i -> axes_values[i][coordinates[v][i]], length(lengths)))
     name(v) = run_name(prefix, point(v))
-    ancestor(v) = parents[v] == 0 ? nothing : parents[v]
-    function node(v)
-        p, g = ancestor(v), isnothing(ancestor(v)) ? nothing : ancestor(ancestor(v))
-        return (; name = name(v), point = point(v), parent = isnothing(p) ? nothing : name(p), grandparent = isnothing(g) ? nothing : name(g),
-                parent_point = isnothing(p) ? nothing : point(p), grandparent_point = isnothing(g) ? nothing : point(g))
-    end
-    return [node(v) for v in order]
+    return [(; name = name(v), point = point(v), parent = parents[v] == 0 ? nothing : name(parents[v])) for v in order]
 end
 
 usable_spin_up(name) = is_finished(name) && !blew_up(name)
-
-# Coordinate in which T is taken as linear along an axis: T_day itself, since T − T_night scales with ΔT, and the logarithm of the others
-predictor_coordinate(axis, value) = axis == :T_day ? float(value) : log(float(value))
-
-# Weight of T_parent − T_grandparent in the predictor (Keller 1977), or nothing unless the three runs lie in order along one axis in `axes`
-function predictor_weight(node, axes)
-    isnothing(node.grandparent) && return nothing
-    differs(a, b) = [k for k in keys(a) if a[k] != b[k]]
-    step, previous = differs(node.point, node.parent_point), differs(node.parent_point, node.grandparent_point)
-    (length(step) == 1 && step == previous && only(step) in axes) || return nothing
-    a = only(step)
-    x, x_p, x_g = predictor_coordinate.(a, (node.point[a], node.parent_point[a], node.grandparent_point[a]))
-    w = (x - x_p) / (x_p - x_g)
-    return w > 0 ? w : nothing
-end
-
-last_frame(ds, name) = (n = size(ds[name], 4); Array(ds[name][:, :, :, n]))
-
-# Start state T_parent + w (T_parent − T_grandparent) clamped to [T_min, T_max], or nothing when the clamp removes too much or the mean profile has a large inversion
-function predicted_temperature(T_parent, T_grandparent, w; T_min, T_max, max_removed = 0.5, max_inversion = 0.05)
-    raw = T_parent .+ w .* (T_parent .- T_grandparent)
-    predicted = clamp.(raw, T_min, T_max)
-    sqrt(mean((raw .- predicted) .^ 2)) > max_removed * sqrt(mean((T_parent .- T_min) .^ 2)) && return nothing
-    profile = vec(mean(predicted; dims = (1, 2)))
-    return minimum(diff(profile)) >= -max_inversion * (T_max - T_min) ? predicted : nothing
-end
-
-"""
-    predicted_donor(name, parent, grandparent, w; T_min, T_max)
-
-Write a run `name` to warm-start from, holding the predicted T and the parent's u, v and grid, and return its name; returns `parent` if the prediction is rejected.
-"""
-function predicted_donor(name, parent, grandparent, w; T_min, T_max)
-    is_finished(name) && isfile(joinpath(directory, "$(name).nc")) && return name
-    T_parent, u, v = NCDataset(ds -> (last_frame(ds, "T"), last_frame(ds, "u"), last_frame(ds, "v")), joinpath(directory, "$(parent).nc"))
-    T_grandparent = NCDataset(ds -> last_frame(ds, "T"), joinpath(directory, "$(grandparent).nc"))
-    T = predicted_temperature(T_parent, T_grandparent, w; T_min, T_max)
-    if isnothing(T)
-        @warn "Predictor rejected for $(name): warm-starting from a copy of $(parent)"
-        return parent
-    end
-    path, partial = joinpath(directory, "$(name).nc"), joinpath(directory, "$(name).nc.partial")
-    NCDataset(partial, "c") do ds
-        defDim(ds, "time", 1)
-        for (variable, data) in (("T", T), ("u", u), ("v", v))
-            dims = ["$(variable)_$(d)" for d in ("x", "y", "z")]
-            foreach((d, n) -> defDim(ds, d, n), dims, size(data))
-            defVar(ds, variable, reshape(data, size(data)..., 1), (dims..., "time"))
-        end
-    end
-    mv(partial, path; force = true)
-    data = read_parameters(parent)
-    data["run"] = Dict("name" => name)
-    data["predictor"] = Dict{String, Any}("parent" => parent, "grandparent" => grandparent, "weight" => w)
-    open(io -> TOML.print(io, data; sorted = true), parameter_file(name), "w")
-    return name
-end
 
 function run_status(name, spin_up_name)
     blew_up(spin_up_name) && return "spin-up blew up"
@@ -122,17 +59,16 @@ Run every combination of the swept values as a `simulation` of a 2° spin-up the
 parameter grid. Each spin-up warm-starts from its parent's (one step along one axis), the root's from rest, and each main stage from its
 own spin-up. `point_settings(point)` gives each run's extra keywords and `spin_up(point, warm_started)` its `low_res_start`. Rerunning skips finished
 stages and resumes cut-off ones. A run whose parent's spin-up is missing or blew up is blocked, and the rest of the tree carries on.
-`plan_only` prints the tree without running it. Along the `predictor_axes`, a run in line with its parent and grandparent starts from their
-extrapolated T rather than a copy of its parent (see `predicted_donor`). `stages = :spin_ups` and `:mains` split the sweep between two processes
+`plan_only` prints the tree without running it. `stages = :spin_ups` and `:mains` split the sweep between two processes
 started together: one walks the tree running spin-ups, the other runs main stages as their spin-ups finish (see `main_stage_worker`).
 Returns each run's name and status.
 """
-function tree_sweep(base; prefix = "tree", point_settings = Returns((;)), spin_up = Returns(SPIN_UP), root = nothing, plan_only = false, predictor_axes = (),
+function tree_sweep(base; prefix = "tree", point_settings = Returns((;)), spin_up = Returns(SPIN_UP), root = nothing, plan_only = false,
                     stages = :all, swept...)
     stages in (:all, :spin_ups, :mains) || error("stages must be :all, :spin_ups or :mains, got $(repr(stages))")
     plan = tree_plan(prefix, swept; root)
     if plan_only
-        foreach(node -> println(node.name, "  <-  ", something(node.parent, "rest"), isnothing(predictor_weight(node, predictor_axes)) ? "" : "  (predictor)"), plan)
+        foreach(node -> println(node.name, "  <-  ", something(node.parent, "rest")), plan)
         return [node.name => "planned" for node in plan]
     end
 
@@ -141,10 +77,7 @@ function tree_sweep(base; prefix = "tree", point_settings = Returns((;)), spin_u
         parent_spin_up = isnothing(node.parent) ? nothing : node.parent * "_spinup"
         params = merge(SWEEP_STORAGE, base, node.point, point_settings(node.point), (; name = node.name))
         minimum(get(params, :resolution, 1.0)) < 1 && !haskey(params, :save_last) && (params = merge(params, (; save_last = HIGH_RES_SAVE_LAST)))
-        w = :spin_up in which ? predictor_weight(node, predictor_axes) : nothing
-        donor = isnothing(w) || is_finished(spin_up_name) || !usable_spin_up(node.grandparent * "_spinup") ? parent_spin_up :
-                predicted_donor(spin_up_name * "_predictor", parent_spin_up, node.grandparent * "_spinup", w; T_min = params.T_night, T_max = params.T_day)
-        simulation(params, spin_up(node.point, !isnothing(parent_spin_up)), donor; spin_up_name, stages = which)
+        simulation(params, spin_up(node.point, !isnothing(parent_spin_up)), parent_spin_up; spin_up_name, stages = which)
         return :main in which ? run_status(node.name, spin_up_name) : blew_up(spin_up_name) ? "spin-up blew up" : is_finished(spin_up_name) ? "spin-up ok" : "spin-up unfinished"
     end
     function attempt(node, which)
